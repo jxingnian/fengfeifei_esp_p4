@@ -1,0 +1,44 @@
+﻿# ESP-IDF 构建目录和 CMake 生成文件
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# ESP-IDF 本地配置文件；项目中的 sdkconfig.ci* 和 sdkconfig.defaults 继续保留
+sdkconfig
+sdkconfig.old
+sdkconfig.bak
+
+# ESP-IDF 组件管理器生成的本地组件目录
+managed_components/
+
+# 编译、链接和烧录生成的固件文件
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+
+# Python 缓存、测试缓存和本地虚拟环境
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# ESP-IDF、Python 和操作系统产生的临时文件
+.idf.py*
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Visual Studio Code 本地工作区文件；保留项目已跟踪的 settings.json
+.vscode/*
+!.vscode/settings.json
