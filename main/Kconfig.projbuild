@@ -1,69 +1,54 @@
-menu "Example Configuration"
+menu "P4 + C5 网络配置"
 
-    config ESP_WIFI_SSID
-        string "WiFi SSID"
+    config P4_C5_WIFI_SSID
+        string "Wi-Fi 名称（SSID）"
         default "myssid"
         help
-            SSID (network name) for the example to connect to.
+            ESP32-P4 通过 ESP32-C5 无线协处理器连接的 2.4 GHz 无线网络名称。
 
-    config ESP_WIFI_PASSWORD
-        string "WiFi Password"
+    config P4_C5_WIFI_PASSWORD
+        string "Wi-Fi 密码"
         default "mypassword"
         help
-            WiFi password (WPA or WPA2) for the example to use.
+            无线网络密码。串口日志只打印 SSID，不打印本字段，避免泄露凭据。
 
-    choice ESP_WIFI_SAE_MODE
-        prompt "WPA3 SAE mode selection"
-        default ESP_STATION_EXAMPLE_WPA3_SAE_PWE_BOTH
+    config P4_C5_WIFI_INITIAL_RETRY_COUNT
+        int "首次连接最大重试次数"
+        range 1 100
+        default 8
         help
-            Select mode for SAE as Hunt and Peck, H2E or both.
-        config ESP_STATION_EXAMPLE_WPA3_SAE_PWE_HUNT_AND_PECK
-            bool "HUNT AND PECK"
-        config ESP_STATION_EXAMPLE_WPA3_SAE_PWE_HASH_TO_ELEMENT
-            bool "H2E"
-            depends on ESP_WIFI_ENABLE_SAE_H2E
-        config ESP_STATION_EXAMPLE_WPA3_SAE_PWE_BOTH
-            bool "BOTH"
-            depends on ESP_WIFI_ENABLE_SAE_H2E
-    endchoice
+            首次启动等待达到该次数后，p4_c5_wifi_start() 返回 ESP_FAIL，
+            但后台自动重连定时器仍会继续工作，不会永久停止网络恢复。
 
-    config ESP_WIFI_PW_ID
-        string "PASSWORD IDENTIFIER"
-        depends on  ESP_STATION_EXAMPLE_WPA3_SAE_PWE_HASH_TO_ELEMENT|| ESP_STATION_EXAMPLE_WPA3_SAE_PWE_BOTH
-        default ""
+    config P4_C5_WIFI_RECONNECT_MAX_DELAY_MS
+        int "自动重连最大间隔（毫秒）"
+        range 1000 60000
+        default 10000
         help
-            password identifier for SAE H2E
+            连续断线时采用线性退避，该数值限制最长等待时间，避免高频重连。
 
-    config ESP_MAXIMUM_RETRY
-        int "Maximum retry"
-        default 5
+    config P4_C5_WIFI_GATEWAY_PING_COUNT
+        int "联网后网关 Ping 次数"
+        range 0 20
+        default 4
         help
-            Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
+            DHCP 成功后向网关发送指定次数 ICMP 请求，用于验证
+            P4、SDIO、C5、接入点之间的数据路径。设置为 0 可关闭测试。
 
-    choice ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD
-        prompt "WiFi Scan auth mode threshold"
-        default ESP_WIFI_AUTH_WPA2_PSK
+    choice P4_C5_WIFI_AUTH_THRESHOLD
+        prompt "允许连接的最低 Wi-Fi 认证方式"
+        default P4_C5_WIFI_AUTH_WPA2_PSK
         help
-            The weakest authmode to accept in the scan mode.
-            This value defaults to ESP_WIFI_AUTH_WPA2_PSK in case password is present and ESP_WIFI_AUTH_OPEN is used.
-            Please select ESP_WIFI_AUTH_WEP/ESP_WIFI_AUTH_WPA_PSK in case AP is operating in WEP/WPA mode.
+            扫描和关联时接受的最低安全等级。正式产品建议保持 WPA2 或更高。
 
-        config ESP_WIFI_AUTH_OPEN
-            bool "OPEN"
-        config ESP_WIFI_AUTH_WEP
-            bool "WEP"
-        config ESP_WIFI_AUTH_WPA_PSK
-            bool "WPA PSK"
-        config ESP_WIFI_AUTH_WPA2_PSK
-            bool "WPA2 PSK"
-        config ESP_WIFI_AUTH_WPA_WPA2_PSK
-            bool "WPA/WPA2 PSK"
-        config ESP_WIFI_AUTH_WPA3_PSK
-            bool "WPA3 PSK"
-        config ESP_WIFI_AUTH_WPA2_WPA3_PSK
-            bool "WPA2/WPA3 PSK"
-        config ESP_WIFI_AUTH_WAPI_PSK
-            bool "WAPI PSK"
+        config P4_C5_WIFI_AUTH_OPEN
+            bool "开放网络"
+
+        config P4_C5_WIFI_AUTH_WPA2_PSK
+            bool "WPA2-PSK"
+
+        config P4_C5_WIFI_AUTH_WPA2_WPA3_PSK
+            bool "WPA2/WPA3-PSK"
     endchoice
 
 endmenu
