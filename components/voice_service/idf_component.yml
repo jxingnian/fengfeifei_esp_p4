@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "ESP32-P4 ES8311 MultiNet custom wake service"
+dependencies:
+  idf: ">=6.0"
+  espressif/esp-sr: "^2.6.0"

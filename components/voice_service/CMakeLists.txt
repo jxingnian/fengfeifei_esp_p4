@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "voice_service.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp-sr
+        voice_board_audio
+        freertos
+        esp_timer
+)

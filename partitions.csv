@@ -1,0 +1,8 @@
+# ESP32-P4 16 MB Flash 分区表。
+# model 分区由 ESP-SR 构建系统写入中文 MultiNet 模型。
+# 当前工程不启用 OTA，factory 分区保留 6 MB，model 分区使用剩余空间。
+# Name,     Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x009000, 16K
+phy_init, data, phy,     0x00D000, 4K
+factory,  app,  factory, 0x010000, 6M
+model,    data, spiffs,  0x610000, 0x9F0000

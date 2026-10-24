@@ -26,6 +26,29 @@
 
 业务适配层。原有业务继续调用 `p4_c5_wifi_start()`、`p4_c5_wifi_wait_connected()`、`p4_c5_wifi_is_connected()` 和 `p4_c5_wifi_get_ip_info()`，不直接操作 Wi-Fi 驱动。
 
+### `components/voice_board_audio`
+
+ESP32-P4-WIFI6-DB 的最小板级音频组件，只引入 ES8311、I2C、I2S 和 GPIO
+依赖，不引入显示、触摸、摄像头和 LVGL：
+
+- I2C：SDA GPIO7、SCL GPIO8，控制器 1。
+- I2S：MCLK GPIO13、BCLK GPIO12、WS GPIO10、DOUT GPIO9、DIN GPIO11，控制器 1。
+- 功放使能：GPIO53；语音识别仅使用 ADC 输入，功放保持关闭。
+- 采集格式：16 kHz、16 bit、单声道，麦克风默认增益 24 dB。
+
+### `components/voice_service`
+
+可复用的 ESP-SR MultiNet 语音组件：
+
+- 加载 `model` 分区中的 `mn7_cn` 中文模型。
+- 注册命令 ID 1 和拼音命令 `ni hao xiao fei`，对应“你好小飞”。
+- 独立 FreeRTOS 任务持续读取 PCM 并调用 MultiNet 检测。
+- 通过回调上报初始化完成、唤醒、识别窗口超时、音频错误、模型错误和停止事件。
+- 业务回调只做队列投递，不直接执行网络请求、音频播放或其他阻塞操作。
+
+当前业务入口在 `main/app_main.c` 注册回调并启动服务。识别到“你好小飞”后，
+业务层收到 `VOICE_SERVICE_EVENT_WAKE_DETECTED`，后续 AI 对话状态机从该事件继续执行。
+
 ## 状态机
 
 1. `STARTING`：初始化 NVS、ESP-Netif、默认事件循环、ESP-Hosted、AP/STA 网络接口、Wi-Fi 驱动和 HTTP 服务。
@@ -82,3 +105,16 @@ bash build/build.sh
 ```
 
 脚本将构建产物放入 `build/esp-idf-output`。
+
+Windows PowerShell 使用 `build/build.ps1`，它会固定 ESP-IDF 工具链路径并避免
+RISC-V C++ 头文件的 Windows 长路径问题：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build\build.ps1
+```
+
+需要清理构建产物时执行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build\build.ps1 -Clean
+```

@@ -8,4 +8,5 @@ idf_component_register(
         nvs_flash
     REQUIRES
         wifi_provisioning
+        voice_service
 )
