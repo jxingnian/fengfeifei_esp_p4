@@ -1,0 +1,51 @@
+menu "Wi-Fi 网页配网组件"
+
+    config WIFI_PROVISIONING_AP_SSID
+        string "配网热点名称"
+        default "FengFeifei-AI"
+        help
+            设备启动后始终开启的 SoftAP 名称。手机连接该热点后访问
+            192.168.4.1 即可打开配网页面。
+
+    config WIFI_PROVISIONING_AP_PASSWORD
+        string "配网热点密码"
+        default "12345678"
+        help
+            SoftAP 密码。留空表示开放热点；非空时必须至少八个字符，否则
+            ESP-IDF Wi-Fi 驱动会拒绝启动热点。
+
+    config WIFI_PROVISIONING_AP_CHANNEL
+        int "配网热点初始信道"
+        range 1 13
+        default 1
+        help
+            AP+STA 模式连接路由器后，SoftAP 会自动跟随目标路由器信道。
+
+    config WIFI_PROVISIONING_AP_MAX_CONNECTION
+        int "配网热点最大客户端数"
+        range 1 8
+        default 4
+
+    config WIFI_PROVISIONING_HTTP_PORT
+        int "配网网页 HTTP 端口"
+        range 1 65535
+        default 80
+
+    choice WIFI_PROVISIONING_AUTH_THRESHOLD
+        prompt "STA 允许的最低认证方式"
+        default WIFI_PROVISIONING_AUTH_WPA2_PSK
+        help
+            正式产品默认拒绝 WEP 和仅 WPA 网络；需要连接开放网络时选择
+            OPEN。网页仍会显示扫描到的全部网络。
+
+        config WIFI_PROVISIONING_AUTH_OPEN
+            bool "OPEN"
+
+        config WIFI_PROVISIONING_AUTH_WPA2_PSK
+            bool "WPA2-PSK"
+
+        config WIFI_PROVISIONING_AUTH_WPA2_WPA3_PSK
+            bool "WPA2/WPA3-PSK"
+    endchoice
+
+endmenu

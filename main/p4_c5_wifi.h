@@ -1,5 +1,13 @@
 #pragma once
 
+/**
+ * @file p4_c5_wifi.h
+ * @brief P4 业务层使用的 Wi-Fi 兼容接口。
+ *
+ * 具体的网页配网功能由 wifi_provisioning 组件提供；本头文件保留原有
+ * p4_c5_wifi_* 名称，避免业务层因为组件替换而修改调用代码。
+ */
+
 #include <stdbool.h>
 
 #include "esp_err.h"
@@ -11,43 +19,25 @@ extern "C" {
 #endif
 
 /**
- * @brief 初始化 ESP32-P4 到 ESP32-C5 的 ESP-Hosted 链路并启动 Wi-Fi Station。
+ * @brief 启动 P4-C5 ESP-Hosted 链路、AP+STA 和网页配网服务。
  *
- * 本函数依次完成 TCP/IP 协议栈、事件循环、ESP-Hosted、Wi-Fi 驱动、
- * Station 参数和自动重连机制的初始化。函数会等待首次连接成功，或者等待
- * 首次重试次数耗尽。首次连接失败后，后台自动重连仍会继续运行。
- *
- * @return ESP_OK 首次连接成功并取得 DHCP 地址。
- * @return ESP_FAIL 首次重试次数耗尽，后台仍会继续重连。
- * @return 其他错误 初始化 ESP-Hosted、网络栈或 Wi-Fi 驱动失败。
+ * 该函数不会等待 STA 联网完成；启动成功后后台任务会自动轮询已保存的
+ * Wi-Fi，每个网络尝试三次，失败后保持热点并进入等待配网状态。
  */
 esp_err_t p4_c5_wifi_start(void);
 
 /**
- * @brief 等待 Wi-Fi 获得有效的 DHCP 地址。
- *
- * @param timeout_ticks 最长等待时间；传入 portMAX_DELAY 表示永久等待。
- * @return ESP_OK 在超时前已经联网。
- * @return ESP_ERR_TIMEOUT 在指定时间内没有联网。
- * @return ESP_ERR_INVALID_STATE 网络模块尚未初始化。
+ * @brief 在指定时间内等待 STA 获取 DHCP 地址。
  */
 esp_err_t p4_c5_wifi_wait_connected(TickType_t timeout_ticks);
 
 /**
- * @brief 查询当前是否已经取得 DHCP 地址。
- *
- * @return true 当前网络可用于上层 TCP、TLS、HTTP、WebSocket 等连接。
- * @return false 当前尚未取得地址或连接已经断开。
+ * @brief 查询 STA 当前是否已联网。
  */
 bool p4_c5_wifi_is_connected(void);
 
 /**
- * @brief 读取当前 Station 接口的 IPv4 地址、掩码和网关。
- *
- * @param[out] ip_info 用于接收当前 IPv4 信息的有效指针。
- * @return ESP_OK 已写入有效地址信息。
- * @return ESP_ERR_INVALID_ARG 参数为空。
- * @return ESP_ERR_INVALID_STATE 尚未联网。
+ * @brief 读取 STA 当前 IPv4 地址、掩码和网关。
  */
 esp_err_t p4_c5_wifi_get_ip_info(esp_netif_ip_info_t *ip_info);
 

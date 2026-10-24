@@ -1,5 +1,6 @@
 ﻿# ESP-IDF 构建目录和 CMake 生成文件
-build/
+build/*
+!build/build.sh
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

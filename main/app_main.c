@@ -23,7 +23,10 @@ static void initialize_nvs(void)
 }
 
 /**
- * @brief P4 应用入口，目前先完成 C5 联网底座，供后续 AI 对话模块直接复用。
+ * @brief P4 应用入口。
+ *
+ * Wi-Fi 组件会立即启动 AP+STA 和网页服务器；STA 的实际联网由后台状态机
+ * 异步完成，因此这里不能把 ESP_FAIL 当成整个网络模块初始化失败。
  */
 void app_main(void)
 {
@@ -31,14 +34,9 @@ void app_main(void)
 
     esp_err_t error = p4_c5_wifi_start();
     if (error == ESP_OK) {
-        ESP_LOGI(TAG, "P4 网络底座已就绪，可以启动 AI 语音、音视频和云服务任务");
+        ESP_LOGI(TAG, "P4 Wi-Fi 配网组件已启动，可以启动 AI 语音、音视频和云服务任务");
         return;
     }
 
-    if (error == ESP_FAIL) {
-        ESP_LOGW(TAG, "首次 Wi-Fi 连接失败，网络模块将在后台持续重连");
-        return;
-    }
-
-    ESP_LOGE(TAG, "P4/C5 网络模块初始化失败：%s", esp_err_to_name(error));
+    ESP_LOGE(TAG, "P4/C5 Wi-Fi 配网组件初始化失败：%s", esp_err_to_name(error));
 }
