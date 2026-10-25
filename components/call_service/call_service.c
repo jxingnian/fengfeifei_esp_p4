@@ -69,7 +69,7 @@ static void finish(const char *reason, bool notify)
 static void capabilities(void)
 {
     const char *text = s_camera_ready
-        ? "{\"type\":\"device_capabilities\",\"capabilities\":[\"microphone\",\"speaker\",\"camera\",\"webrtc\"]}"
+        ? "{\"type\":\"device_capabilities\",\"capabilities\":[\"microphone\",\"speaker\",\"camera\",\"webrtc\",\"rtc-livekit\"]}"
         : "{\"type\":\"device_capabilities\",\"capabilities\":[\"microphone\",\"speaker\"]}";
     (void)s_send(false, text, strlen(text));
 }
@@ -100,10 +100,8 @@ static void process(message_t *item)
     const char *media = field(root, "media");
     bool rtc = !strcmp(media, "webrtc");
     if (media[0] && !rtc && strcmp(media, "pcm")) { signal_call("call_reject", id, "unsupported_media"); goto done; }
-    const char *url = field(root, "rtcUrl"), *token = field(root, "token");
-    if (rtc && ((strncmp(url, "wss://", 6) && strncmp(url, "ws://", 5)) || strlen(url) > 512 || !token[0] || strlen(token) > 8192)) {
-        signal_call("call_reject", id, "invalid_offer"); goto done;
-    }
+    const char *provider = field(root, "provider");
+    if (!provider[0]) provider = "livekit"; /* Compatibility with existing web calls. */
     if (esp_timer_get_time() - item->received > 30000000) { signal_call("call_reject", id, "expired"); goto done; }
     strlcpy(s_call_id, id, sizeof(s_call_id));
     s_active = true; s_rtc = rtc; s_accepted = false;
@@ -111,7 +109,8 @@ static void process(message_t *item)
     s_voice_stopped = true;
     if (voice_service_stop() != ESP_OK) { finish("audio_busy", true); goto done; }
     if (rtc) {
-        if (call_media_connect(url, token) != ESP_OK) finish("media_failed", true);
+        esp_err_t error = call_media_connect(provider, (char *)item->data);
+        if (error != ESP_OK) finish(error == ESP_ERR_NOT_SUPPORTED ? "unsupported_provider" : "media_failed", true);
     } else {
         if (voice_board_audio_set_output_enabled(true) != ESP_OK) { finish("audio_failed", true); goto done; }
         s_accepted = true; signal_call("call_accept", s_call_id, NULL);
@@ -143,14 +142,14 @@ static void worker(void *arg)
         int64_t now = esp_timer_get_time();
         if (!s_accepted && now >= s_deadline) { finish("timeout", true); continue; }
         if (s_rtc) {
-            livekit_connection_state_t state = call_media_state();
-            if (call_media_failed() || state == LIVEKIT_CONNECTION_STATE_FAILED) { finish("media_failed", true); continue; }
-            if (state == LIVEKIT_CONNECTION_STATE_CONNECTED) {
+            call_media_state_t state = call_media_state();
+            if (call_media_failed() || state == CALL_MEDIA_FAILED) { finish("media_failed", true); continue; }
+            if (state == CALL_MEDIA_CONNECTED) {
                 s_reconnect_deadline = 0;
                 if (!s_accepted && call_media_started()) { s_accepted = true; signal_call("call_accept", s_call_id, NULL); }
             } else if (s_accepted) {
                 if (!s_reconnect_deadline) s_reconnect_deadline = now + 15000000;
-                if (state == LIVEKIT_CONNECTION_STATE_DISCONNECTED || now >= s_reconnect_deadline) finish("media_disconnected", true);
+                if (state == CALL_MEDIA_DISCONNECTED || now >= s_reconnect_deadline) finish("media_disconnected", true);
             }
         } else if (s_accepted) {
             int16_t pcm[320];

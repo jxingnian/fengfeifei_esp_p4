@@ -20,7 +20,9 @@
 ## 代码入口与生命周期
 
 - `components/call_service/call_service.c`：业务 WS 非阻塞投递到有界队列，由单一 worker 管理呼叫。
-- `components/call_service/call_media.c`：共享板级音频句柄、V4L2 采集、Opus/H.264、LiveKit 房间、音频播放。
+- `components/call_service/call_media.c`：厂商注册与中立媒体接口，worker 不引用厂商 SDK 类型。
+- `components/call_service/call_media_provider.h`：媒体适配 ops，支持后续并行注册厂商。
+- `components/call_service/call_media_livekit.c`：共享板级音频句柄、V4L2 采集、Opus/H.264、LiveKit 房间、音频播放。
 - `components/voice_board_audio`：借用总线/codec 接口，通话结束恢复识别采样格式及增益。
 - `main/app_main.c`：先初始化语音和通话队列、探测摄像头，再启动业务网关。
 - `components/esp_capture`、`components/av_render`：固定版本的本地兼容组件，来源与修改见 `RTC_THIRD_PARTY.md`。
@@ -65,6 +67,16 @@ P4 中不存 LiveKit API secret，通话期间临时令牌由已鉴权业务连�
 HTTPS/WSS 需要时间同步与正确证书；沿用网关现有 SNTP，不关闭证书校验。
 
 后台部署与网页测试详见 `../../xn_ai_server/docs/RTC_CALLS.md`。
+微信小程序复用相同固件和 LiveKit 设备发布轨道，网关方案见 `../../xn_ai_server/docs/MINI_RTC.md`。
+
+## 厂商扩展
+
+设备成功探测摄像头时额外上报 `rtc-livekit`。offer 的 `provider` 决定媒体适配器，
+历史无 provider 的 WebRTC offer 默认 LiveKit；不支持的厂商返回 `unsupported_provider`。
+协议 worker 只依赖中立的 CONNECTING/CONNECTED/FAILED/DISCONNECTED 状态。
+接入声网需新增并注册 ops、初始化与能力探测、CMake 依赖和 `rtc-agora` 能力声明，
+由适配器解析对应凭证与 SDK 资源，不把厂商类型带回通话业务。
+当前只实现 LiveKit；不能仅修改后台 provider 就让现有固件接入声网。
 
 ## 必须完成的真机验收
 
