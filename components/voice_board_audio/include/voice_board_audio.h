@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "esp_err.h"
 
@@ -27,6 +28,11 @@ esp_err_t voice_board_audio_init(void);
  * @brief 从 ES8311 读取指定数量的 16 bit PCM 样本。
  */
 esp_err_t voice_board_audio_read(int16_t *samples, size_t sample_count);
+
+/** Write 16 kHz, 16 bit, mono PCM to the ES8311 speaker. */
+esp_err_t voice_board_audio_write(const int16_t *samples, size_t sample_count);
+
+esp_err_t voice_board_audio_set_output_enabled(bool enabled);
 
 /**
  * @brief 关闭并释放音频资源。

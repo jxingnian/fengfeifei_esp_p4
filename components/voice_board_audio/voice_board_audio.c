@@ -51,6 +51,7 @@ static const audio_codec_gpio_if_t *s_gpio_if;
 static const audio_codec_ctrl_if_t *s_ctrl_if;
 static const audio_codec_if_t *s_codec_if;
 static esp_codec_dev_handle_t s_microphone;
+static esp_codec_dev_handle_t s_speaker;
 static bool s_initialized;
 
 /**
@@ -62,6 +63,11 @@ static void voice_board_audio_cleanup(void)
         (void)esp_codec_dev_close(s_microphone);
         esp_codec_dev_delete(s_microphone);
         s_microphone = NULL;
+    }
+    if (s_speaker != NULL) {
+        (void)esp_codec_dev_close(s_speaker);
+        esp_codec_dev_delete(s_speaker);
+        s_speaker = NULL;
     }
 
     if (s_codec_if != NULL) {
@@ -243,6 +249,10 @@ static esp_err_t voice_board_audio_init_codec(void)
         return ESP_ERR_NO_MEM;
     }
 
+    device_config.dev_type = ESP_CODEC_DEV_TYPE_OUT;
+    s_speaker = esp_codec_dev_new(&device_config);
+    if (s_speaker == NULL) return ESP_ERR_NO_MEM;
+
     esp_codec_dev_sample_info_t sample_info = {
         .sample_rate = AUDIO_SAMPLE_RATE_HZ,
         .channel = I2S_SLOT_MODE_MONO,
@@ -253,6 +263,8 @@ static esp_err_t voice_board_audio_init_codec(void)
         ESP_LOGE(TAG, "打开 ES8311 麦克风失败：%s", esp_err_to_name(error));
         return error;
     }
+    error = esp_codec_dev_open(s_speaker, &sample_info);
+    if (error != ESP_OK) return error;
 
     /*
      * 官方开发板录音示例提供 24 dB 麦克风增益选项。这里在设备打开后
@@ -312,4 +324,16 @@ esp_err_t voice_board_audio_deinit(void)
 {
     voice_board_audio_cleanup();
     return ESP_OK;
+}
+
+esp_err_t voice_board_audio_write(const int16_t *samples, size_t sample_count)
+{
+    if (!s_initialized || s_speaker == NULL || samples == NULL || sample_count == 0) return ESP_ERR_INVALID_STATE;
+    return esp_codec_dev_write(s_speaker, (void *)samples, sample_count * sizeof(int16_t));
+}
+
+esp_err_t voice_board_audio_set_output_enabled(bool enabled)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    return gpio_set_level(AUDIO_PA_GPIO, enabled ? 1 : 0);
 }

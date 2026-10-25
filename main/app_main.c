@@ -9,12 +9,24 @@
 #include "p4_c5_wifi.h"
 #include "voice_service.h"
 #include "cloud_gateway.h"
+#include "call_service.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "app_main";
+
+static esp_err_t send_call_media(bool binary, const void *data, size_t length)
+{
+    return cloud_gateway_send(binary, data, length);
+}
+
+static void on_cloud_message(bool binary, const void *data, size_t length, void *context)
+{
+    (void)context;
+    call_service_on_cloud_message(binary, data, length);
+}
 
 /**
  * @brief 初始化保存 Wi-Fi 配置和系统参数所需的 NVS 分区。
@@ -80,7 +92,8 @@ void app_main(void)
 
     esp_err_t error = p4_c5_wifi_start();
     if (error == ESP_OK) {
-        esp_err_t cloud_error = cloud_gateway_start(NULL);
+        cloud_gateway_config_t gateway_config = { .on_message = on_cloud_message, .context = NULL };
+        esp_err_t cloud_error = cloud_gateway_start(&gateway_config);
         if (cloud_error != ESP_OK) {
             ESP_LOGE(TAG, "Cloud gateway startup failed: %s", esp_err_to_name(cloud_error));
         }
@@ -100,6 +113,12 @@ void app_main(void)
     error = voice_service_start();
     if (error != ESP_OK) {
         ESP_LOGE(TAG, "语音监听启动失败：%s", esp_err_to_name(error));
+        return;
+    }
+
+    error = call_service_init(send_call_media);
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "通话服务启动失败：%s", esp_err_to_name(error));
         return;
     }
 
