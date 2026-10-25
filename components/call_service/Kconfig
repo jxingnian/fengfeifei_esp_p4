@@ -1,0 +1,18 @@
+menu "Device audio/video calls"
+    config CALL_VIDEO_WIDTH
+        int "H264 width (must match the selected CSI sensor mode)"
+        default 800
+        range 16 1920
+    config CALL_VIDEO_HEIGHT
+        int "H264 height (must match the selected CSI sensor mode)"
+        default 1280
+        range 16 1920
+    config CALL_VIDEO_FPS
+        int "Published video FPS"
+        default 15
+        range 1 30
+    config CALL_SPEAKER_VOLUME
+        int "Call speaker volume"
+        default 65
+        range 0 100
+endmenu

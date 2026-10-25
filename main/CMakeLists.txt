@@ -10,4 +10,5 @@ idf_component_register(
         wifi_provisioning
         voice_service
         cloud_gateway
+        call_service
 )

@@ -1,0 +1,11 @@
+dependencies:
+  livekit/livekit: "0.3.11"
+  espressif/esp_video: "^2.3.0"
+  espressif/esp_audio_codec: "~2.3.0"
+  espressif/esp_video_codec: "~0.5.2"
+  espressif/esp_capture:
+    version: "0.7.11"
+    override_path: ../esp_capture
+  tempotian/av_render:
+    version: "0.9.1"
+    override_path: ../av_render

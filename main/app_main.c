@@ -92,11 +92,6 @@ void app_main(void)
 
     esp_err_t error = p4_c5_wifi_start();
     if (error == ESP_OK) {
-        cloud_gateway_config_t gateway_config = { .on_message = on_cloud_message, .context = NULL };
-        esp_err_t cloud_error = cloud_gateway_start(&gateway_config);
-        if (cloud_error != ESP_OK) {
-            ESP_LOGE(TAG, "Cloud gateway startup failed: %s", esp_err_to_name(cloud_error));
-        }
         ESP_LOGI(TAG, "P4/C5 Wi-Fi 配网组件已启动");
     } else {
         ESP_LOGE(TAG, "P4/C5 Wi-Fi 配网组件初始化失败：%s", esp_err_to_name(error));
@@ -110,17 +105,22 @@ void app_main(void)
         return;
     }
 
-    error = voice_service_start();
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "语音监听启动失败：%s", esp_err_to_name(error));
-        return;
-    }
-
+    /* Initialize the call queue/camera before accepting cloud messages, and
+     * before the voice task begins using the shared codec/I2C resources. */
     error = call_service_init(send_call_media);
     if (error != ESP_OK) {
         ESP_LOGE(TAG, "通话服务启动失败：%s", esp_err_to_name(error));
         return;
     }
 
+    error = voice_service_start();
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "语音监听启动失败：%s", esp_err_to_name(error));
+        return;
+    }
+
+    cloud_gateway_config_t gateway_config = { .on_message = on_cloud_message, .context = NULL };
+    error = cloud_gateway_start(&gateway_config);
+    if (error != ESP_OK) ESP_LOGE(TAG, "Cloud gateway startup failed: %s", esp_err_to_name(error));
     ESP_LOGI(TAG, "系统启动完成，当前唤醒词为：你好小飞");
 }

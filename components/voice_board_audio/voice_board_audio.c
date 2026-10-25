@@ -337,3 +337,22 @@ esp_err_t voice_board_audio_set_output_enabled(bool enabled)
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
     return gpio_set_level(AUDIO_PA_GPIO, enabled ? 1 : 0);
 }
+
+i2c_master_bus_handle_t voice_board_audio_i2c_bus(void) { return s_i2c_bus; }
+esp_codec_dev_handle_t voice_board_audio_microphone(void) { return s_microphone; }
+esp_codec_dev_handle_t voice_board_audio_speaker(void) { return s_speaker; }
+
+esp_err_t voice_board_audio_restore(void)
+{
+    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    (void)esp_codec_dev_close(s_microphone);
+    (void)esp_codec_dev_close(s_speaker);
+    esp_codec_dev_sample_info_t info = {
+        .sample_rate = 16000, .channel = 1, .bits_per_sample = 16,
+    };
+    esp_err_t error = esp_codec_dev_open(s_microphone, &info);
+    if (error == ESP_OK) error = esp_codec_dev_open(s_speaker, &info);
+    if (error == ESP_OK) error = esp_codec_dev_set_in_gain(s_microphone, CONFIG_VOICE_SERVICE_MIC_GAIN_DB);
+    (void)voice_board_audio_set_output_enabled(false);
+    return error;
+}
