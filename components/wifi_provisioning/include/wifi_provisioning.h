@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_http_server.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 
@@ -79,6 +80,10 @@ typedef struct {
  * @return 其他 ESP-IDF 错误码表示底层网络或 HTTP 服务初始化失败。
  */
 esp_err_t wifi_provisioning_start(void);
+
+/* Register optional local management routes before start. The array must have
+ * static lifetime. Extensions must not depend on private Wi-Fi state. */
+esp_err_t wifi_provisioning_register_web_extension(const httpd_uri_t *handlers, size_t count);
 
 /**
  * @brief 等待 STA 成功获取 DHCP 地址。

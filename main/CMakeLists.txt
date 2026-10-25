@@ -9,4 +9,5 @@ idf_component_register(
     REQUIRES
         wifi_provisioning
         voice_service
+        cloud_gateway
 )

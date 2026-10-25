@@ -16,6 +16,26 @@
 #define WIFI_PROVISIONING_JSON_STRING_SIZE 192U
 
 static const char *TAG = "wifi_web";
+static httpd_uri_t s_extensions[12];
+static size_t s_extension_count;
+static bool s_web_started;
+
+esp_err_t wifi_provisioning_register_web_extension(const httpd_uri_t *handlers, size_t count)
+{
+    if (!handlers || !count || count > 12 - s_extension_count) return ESP_ERR_INVALID_ARG;
+    if (s_web_started) return ESP_ERR_INVALID_STATE;
+    for (size_t i = 0; i < count; ++i) {
+        if (!handlers[i].uri || !handlers[i].handler) return ESP_ERR_INVALID_ARG;
+        for (size_t j = 0; j < s_extension_count + i; ++j) {
+            const httpd_uri_t *other = j < s_extension_count ? &s_extensions[j] : &handlers[j - s_extension_count];
+            if (other->method == handlers[i].method && !strcmp(other->uri, handlers[i].uri))
+                return ESP_ERR_INVALID_ARG;
+        }
+    }
+    memcpy(s_extensions + s_extension_count, handlers, count * sizeof(*handlers));
+    s_extension_count += count;
+    return ESP_OK;
+}
 
 /**
  * @brief 内置的单页配网界面。
@@ -46,6 +66,7 @@ static const char s_index_html[] =
     "<div id='message' class='message'></div><div id='scanList'></div></div>"
     "<div class='card'><h2>已保存 Wi-Fi</h2><div id='savedList' class='tip'>读取中</div></div>"
     "<div class='tip'>设备始终保持 AP+STA 模式。开机或断网后会按列表顺序轮询，每个 Wi-Fi 最多尝试 3 次；全部失败后保持热点和本页面继续配网。</div>"
+    "<iframe title='后台连接与配对' src='/cloud' style='width:100%;height:680px;border:0;margin-top:16px' loading='eager'></iframe>"
     "</div><script>"
     "const stateText={0:'已停止',1:'启动中',2:'正在连接',3:'已联网',4:'等待配网'};"
     "async function getJson(url,opt){const r=await fetch(url,opt);const j=await r.json();if(!r.ok)throw new Error(j.message||'请求失败');return j;}"
@@ -380,7 +401,8 @@ esp_err_t wifi_provisioning_web_start(httpd_handle_t *server)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = CONFIG_WIFI_PROVISIONING_HTTP_PORT;
-    config.max_uri_handlers = 8U;
+    config.max_uri_handlers = 8U + s_extension_count;
+    config.stack_size = 8192;
     config.lru_purge_enable = true;
 
     esp_err_t error = httpd_start(server, &config);
@@ -407,5 +429,14 @@ esp_err_t wifi_provisioning_web_start(httpd_handle_t *server)
         }
     }
 
+    for (size_t index = 0; index < s_extension_count; ++index) {
+        error = httpd_register_uri_handler(*server, &s_extensions[index]);
+        if (error != ESP_OK) {
+            httpd_stop(*server);
+            *server = NULL;
+            return error;
+        }
+    }
+    s_web_started = true;
     return ESP_OK;
 }

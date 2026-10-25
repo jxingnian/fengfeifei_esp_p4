@@ -8,6 +8,7 @@
  */
 #include "p4_c5_wifi.h"
 #include "voice_service.h"
+#include "cloud_gateway.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -75,9 +76,14 @@ static void on_voice_service_event(
 void app_main(void)
 {
     initialize_nvs();
+    ESP_ERROR_CHECK(cloud_gateway_web_register());
 
     esp_err_t error = p4_c5_wifi_start();
     if (error == ESP_OK) {
+        esp_err_t cloud_error = cloud_gateway_start(NULL);
+        if (cloud_error != ESP_OK) {
+            ESP_LOGE(TAG, "Cloud gateway startup failed: %s", esp_err_to_name(cloud_error));
+        }
         ESP_LOGI(TAG, "P4/C5 Wi-Fi 配网组件已启动");
     } else {
         ESP_LOGE(TAG, "P4/C5 Wi-Fi 配网组件初始化失败：%s", esp_err_to_name(error));
