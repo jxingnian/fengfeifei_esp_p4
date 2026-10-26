@@ -8,6 +8,7 @@
  */
 #include "p4_c5_wifi.h"
 #include "voice_service.h"
+#include "voice_ai_service.h"
 #include "cloud_gateway.h"
 #include "call_service.h"
 
@@ -25,7 +26,24 @@ static esp_err_t send_call_media(bool binary, const void *data, size_t length)
 static void on_cloud_message(bool binary, const void *data, size_t length, void *context)
 {
     (void)context;
+    /*
+     * AI 服务先复制并排队后台消息，通话服务再处理通话控制和通话 PCM。
+     * 两个服务各自判断当前状态，AI 音频不会被通话服务错误地当作通话音频播放。
+     */
+    voice_ai_service_on_cloud_message(binary, data, length);
     call_service_on_cloud_message(binary, data, length);
+}
+
+/**
+ * @brief 把统一麦克风采集任务输出的 PCM 交给 AI 会话服务。
+ *
+ * 该回调只负责快速转发；采集任务、网络发送任务和播放任务各自独立运行，
+ * 不在这里等待后台响应，避免网络抖动阻塞本地唤醒识别。
+ */
+static void on_voice_pcm(const int16_t *samples, size_t sample_count, void *context)
+{
+    (void)context;
+    voice_ai_service_on_pcm(samples, sample_count, NULL);
 }
 
 /**
@@ -66,6 +84,7 @@ static void on_voice_service_event(
         break;
     case VOICE_SERVICE_EVENT_WAKE_DETECTED:
         ESP_LOGI(TAG, "业务层收到唤醒事件：你好小飞，概率：%.3f", event->probability);
+        voice_ai_service_on_wake_detected();
         break;
     case VOICE_SERVICE_EVENT_AUDIO_ERROR:
     case VOICE_SERVICE_EVENT_MODEL_ERROR:
@@ -98,6 +117,8 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(voice_service_register_callback(on_voice_service_event, NULL));
+    ESP_ERROR_CHECK(voice_ai_service_init());
+    ESP_ERROR_CHECK(voice_service_register_pcm_callback(on_voice_pcm, NULL));
 
     error = voice_service_init();
     if (error != ESP_OK) {

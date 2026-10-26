@@ -12,6 +12,8 @@ extern "C" {
 #define CLOUD_GATEWAY_URL_SIZE 192
 #define CLOUD_GATEWAY_TENANT_SIZE 65
 #define CLOUD_GATEWAY_MAX_MESSAGE 16384
+/* 网络收发任务与业务任务之间的缓冲数量；音频和控制消息仍由上层分类。 */
+#define CLOUD_GATEWAY_QUEUE_LENGTH 64
 
 typedef enum {
     CLOUD_GATEWAY_WAIT_NETWORK,
@@ -31,6 +33,8 @@ typedef struct {
     cloud_gateway_state_t state;
     bool paired;
     bool connected;
+    /* 每次后台 WebSocket 断开后递增，业务层可据此拒绝沿用旧连接状态。 */
+    uint32_t connection_epoch;
     char server_url[CLOUD_GATEWAY_URL_SIZE];
     char tenant_id[CLOUD_GATEWAY_TENANT_SIZE];
     char device_uid[40];

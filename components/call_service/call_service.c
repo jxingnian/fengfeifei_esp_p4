@@ -13,6 +13,7 @@
 #include "cloud_gateway.h"
 #include "voice_board_audio.h"
 #include "voice_service.h"
+#include "voice_ai_service.h"
 
 typedef struct { size_t length; bool binary; uint8_t *data; int64_t received; } message_t;
 static QueueHandle_t s_queue;
@@ -29,6 +30,27 @@ static const char *field(cJSON *root, const char *name)
 {
     const char *value = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, name));
     return value ? value : "";
+}
+
+/**
+ * @brief 判断后台文字消息是否属于通话服务。
+ *
+ * AI 语音事件和通话事件共用后台 WebSocket。通话服务只接收 ready、
+ * call_offer、call_end 三类消息，其他消息在进入通话队列前直接丢弃，
+ * 避免 Coze 的高频文字事件和 AI 音频占满通话队列。
+ */
+static bool is_call_text_message(const void *data, size_t length)
+{
+    cJSON *root = cJSON_ParseWithLength((const char *)data, length);
+    if (root == NULL) {
+        return false;
+    }
+
+    const char *type = field(root, "type");
+    bool accepted = !strcmp(type, "ready") || !strcmp(type, "call_offer") ||
+                    !strcmp(type, "call_end");
+    cJSON_Delete(root);
+    return accepted;
 }
 
 static void signal_call(const char *type, const char *id, const char *reason)
@@ -69,8 +91,8 @@ static void finish(const char *reason, bool notify)
 static void capabilities(void)
 {
     const char *text = s_camera_ready
-        ? "{\"type\":\"device_capabilities\",\"capabilities\":[\"microphone\",\"speaker\",\"camera\",\"webrtc\",\"rtc-livekit\"]}"
-        : "{\"type\":\"device_capabilities\",\"capabilities\":[\"microphone\",\"speaker\"]}";
+        ? "{\"type\":\"device_capabilities\",\"capabilities\":[\"microphone\",\"speaker\",\"ai-voice\",\"coze-realtime-pcm\",\"camera\",\"webrtc\",\"rtc-livekit\"]}"
+        : "{\"type\":\"device_capabilities\",\"capabilities\":[\"microphone\",\"speaker\",\"ai-voice\",\"coze-realtime-pcm\"]}";
     (void)s_send(false, text, strlen(text));
 }
 
@@ -103,6 +125,11 @@ static void process(message_t *item)
     const char *provider = field(root, "provider");
     if (!provider[0]) provider = "livekit"; /* Compatibility with existing web calls. */
     if (esp_timer_get_time() - item->received > 30000000) { signal_call("call_reject", id, "expired"); goto done; }
+    /*
+     * 通话拥有麦克风、扬声器和摄像头的最高优先级。
+     * 先结束 AI 会话，再停止统一语音采集任务，避免 AI 音频帧与通话媒体混流。
+     */
+    voice_ai_service_stop_session("视频通话抢占音频资源");
     strlcpy(s_call_id, id, sizeof(s_call_id));
     s_active = true; s_rtc = rtc; s_accepted = false;
     s_deadline = item->received + 35000000;
@@ -176,6 +203,10 @@ esp_err_t call_service_init(call_service_send_t send)
 void call_service_on_cloud_message(bool binary, const void *data, size_t length)
 {
     if (!s_queue || !data || !length || length > (binary ? 4096 : CLOUD_GATEWAY_MAX_MESSAGE)) return;
+    /* 通话未建立时不接收 AI 下行 PCM；通话建立后只接收 PCM 通话媒体。 */
+    if (binary && (!s_active || s_rtc)) return;
+    /* 文本消息先按协议类型过滤，禁止 AI 内部事件进入通话队列。 */
+    if (!binary && !is_call_text_message(data, length)) return;
     message_t item = { .length = length, .binary = binary,
         .data = calloc(1, length + 1), .received = esp_timer_get_time() };
     if (!item.data) { atomic_store(&s_overflow, true); return; }

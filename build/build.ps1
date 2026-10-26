@@ -21,6 +21,16 @@ if ($LASTEXITCODE -ne 0) { throw ('第三方组件兼容补丁失败，退出码
 
 $env:IDF_PATH = $IdfPath
 $env:IDF_PYTHON_ENV_PATH = Split-Path $pythonPath -Parent | Split-Path -Parent
+# ESP-IDF 的 Python 环境不会自动把 CMake、Ninja 和交叉编译器加入当前
+# PowerShell 进程；显式补充已安装版本，确保脚本在干净终端中也能正式构建。
+$toolBinPaths = @(
+    'D:\Espressif\tools\cmake\4.0.3\bin',
+    'D:\Espressif\tools\ninja\1.12.1',
+    'D:\Espressif\tools\riscv32-esp-elf\esp-15.2.0_20251204\bin',
+    'D:\Espressif\tools\xtensa-esp-elf\esp-15.2.0_20251204\bin',
+    'D:\Espressif\tools\esp-clang\esp-21.1.3_20260408\bin'
+)
+$env:Path = (($toolBinPaths | Where-Object { Test-Path -LiteralPath $_ }) -join ';') + ';' + $env:Path
 # 某些未执行 export.ps1 的环境不会提供 ESP_IDF_VERSION；从默认目录名 v6.1-beta1 补齐它。
 if (-not $env:ESP_IDF_VERSION) {
     $idfVersionDirectory = Split-Path (Split-Path $IdfPath -Parent) -Leaf

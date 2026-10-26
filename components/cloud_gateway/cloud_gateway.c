@@ -9,6 +9,7 @@
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_mac.h"
+#include "esp_log.h"
 #include "esp_netif_sntp.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -19,6 +20,8 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 #include "wifi_provisioning.h"
+
+static const char *TAG = "cloud_gateway";
 
 /* Only worker owns client/storage. Callback copies bounded messages to queue.
  * Epochs prevent queued traffic from an old connection reaching a new session. */
@@ -96,6 +99,7 @@ static void publish(cloud_gateway_state_t state, const char *message)
     s_status.state = state;
     s_status.paired = s_credentials.auth_code[0] != 0;
     s_status.connected = s_open;
+    s_status.connection_epoch = s_epoch;
     strlcpy(s_status.server_url, s_credentials.server_url, sizeof(s_status.server_url));
     strlcpy(s_status.tenant_id, s_credentials.tenant_id, sizeof(s_status.tenant_id));
     strlcpy(s_status.device_id, s_credentials.device_id, sizeof(s_status.device_id));
@@ -131,6 +135,7 @@ static esp_err_t enqueue(item_type_t type, bool binary, const void *data, size_t
     }
     if (xQueueSend(s_queue, &item, 0) != pdTRUE) {
         free(item.data);
+        ESP_LOGW(TAG, "后台上行队列已满：type=%d，length=%u", (int)type, (unsigned)length);
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
@@ -202,6 +207,8 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *event)
     } else return;
     if (xQueueSend(s_queue, &item, pdMS_TO_TICKS(100)) != pdTRUE) {
         free(item.data);
+        ESP_LOGE(TAG, "后台下行接收队列已满，准备重建 WebSocket：binary=%d，length=%u",
+                 item.binary ? 1 : 0, (unsigned)item.length);
         atomic_store(&s_overflow, true);
     }
 }
@@ -214,6 +221,7 @@ static void disconnect_client(void)
     ++s_epoch;
     s_view.connected = false;
     s_view.state = CLOUD_GATEWAY_CONNECTING;
+    s_view.connection_epoch = s_epoch;
     xSemaphoreGive(s_mutex);
     if (s_client) {
         esp_websocket_client_stop(s_client);
@@ -390,7 +398,11 @@ static void process_item(item_t *item)
         int sent = item->binary
             ? esp_websocket_client_send_bin(s_client, item->data, item->length, pdMS_TO_TICKS(2000))
             : esp_websocket_client_send_text(s_client, item->data, item->length, pdMS_TO_TICKS(2000));
-        if (sent != (int)item->length) s_restart = true;
+        if (sent != (int)item->length) {
+            ESP_LOGE(TAG, "后台上行 WebSocket 发送不完整：binary=%d，expected=%u，sent=%d",
+                     item->binary ? 1 : 0, (unsigned)item->length, sent);
+            s_restart = true;
+        }
     }
 }
 
@@ -481,7 +493,7 @@ esp_err_t cloud_gateway_start(const cloud_gateway_config_t *config)
     snprintf(s_status.device_uid, sizeof(s_status.device_uid), "p4c5-%02x%02x%02x%02x%02x%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     s_mutex = xSemaphoreCreateMutex();
-    s_queue = xQueueCreate(12, sizeof(item_t));
+    s_queue = xQueueCreate(CLOUD_GATEWAY_QUEUE_LENGTH, sizeof(item_t));
     if (!s_mutex || !s_queue) {
         if (s_mutex) vSemaphoreDelete(s_mutex);
         if (s_queue) vQueueDelete(s_queue);

@@ -12,6 +12,7 @@
 #include "voice_service.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -42,9 +43,12 @@ static model_iface_data_t *s_multinet_data;
 static bool s_commands_allocated;
 static TaskHandle_t s_recognition_task;
 static volatile bool s_running;
+static volatile bool s_conversation_active;
 static voice_service_state_t s_state = VOICE_SERVICE_STATE_STOPPED;
 static voice_service_event_callback_t s_callback;
 static void *s_callback_context;
+static voice_service_pcm_callback_t s_pcm_callback;
+static void *s_pcm_callback_context;
 
 /**
  * @brief 向业务层发送事件。
@@ -232,6 +236,17 @@ static void voice_service_recognition_task(void *argument)
             break;
         }
 
+        /*
+         * 唤醒成功后继续复用同一个读取任务，把 PCM 交给 AI 会话服务。
+         * 这里不再调用 MultiNet，避免 AI 会话期间第二次读取同一音频设备。
+         */
+        if (s_conversation_active) {
+            if (s_pcm_callback != NULL) {
+                s_pcm_callback(audio_buffer, (size_t)sample_chunk_size, s_pcm_callback_context);
+            }
+            continue;
+        }
+
         esp_mn_state_t state = s_multinet->detect(s_multinet_data, audio_buffer);
         if (state == ESP_MN_STATE_TIMEOUT) {
             /* MultiNet 完成一次识别窗口但没有得到可用命令，继续监听。 */
@@ -255,6 +270,8 @@ static void voice_service_recognition_task(void *argument)
 
             ESP_LOGI(TAG, "检测到唤醒词：你好小飞，概率：%.3f",
                      result->prob[result_index]);
+            /* 先切换采集模式，再通知业务层，保证唤醒回调返回后立即上传下一帧 PCM。 */
+            s_conversation_active = true;
             voice_service_emit_event(
                 VOICE_SERVICE_EVENT_WAKE_DETECTED,
                 result->command_id[result_index],
@@ -284,6 +301,16 @@ esp_err_t voice_service_register_callback(
     return ESP_OK;
 }
 
+esp_err_t voice_service_register_pcm_callback(
+    voice_service_pcm_callback_t callback,
+    void *user_context
+)
+{
+    s_pcm_callback = callback;
+    s_pcm_callback_context = user_context;
+    return ESP_OK;
+}
+
 esp_err_t voice_service_init(void)
 {
     if (s_state != VOICE_SERVICE_STATE_STOPPED) {
@@ -291,6 +318,7 @@ esp_err_t voice_service_init(void)
     }
 
     s_state = VOICE_SERVICE_STATE_STARTING;
+    s_conversation_active = false;
     esp_err_t error = voice_service_init_microphone();
     if (error == ESP_OK) {
         error = voice_service_init_multinet();
@@ -354,6 +382,21 @@ esp_err_t voice_service_stop(void)
      * 不再重复发送，避免业务层收到两个相同的停止通知。
      */
     return ESP_OK;
+}
+
+void voice_service_start_conversation(void)
+{
+    s_conversation_active = true;
+}
+
+void voice_service_stop_conversation(void)
+{
+    s_conversation_active = false;
+}
+
+bool voice_service_is_conversation_active(void)
+{
+    return s_conversation_active;
 }
 
 voice_service_state_t voice_service_get_state(void)

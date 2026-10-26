@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "voice_ai_service.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        cloud_gateway
+        voice_board_audio
+        voice_service
+        cjson
+        freertos
+        esp_timer
+)

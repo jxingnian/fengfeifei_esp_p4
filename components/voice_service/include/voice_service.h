@@ -8,6 +8,10 @@
  */
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -59,10 +63,30 @@ typedef void (*voice_service_event_callback_t)(
 );
 
 /**
+ * @brief 统一麦克风采集任务输出的 PCM 回调。
+ *
+ * 回调运行在 voice_service 的 FreeRTOS 任务中，调用方只能执行快速、
+ * 非阻塞的数据投递，不得在回调中等待网络、播放音频或执行长时间计算。
+ */
+typedef void (*voice_service_pcm_callback_t)(
+    const int16_t *samples,
+    size_t sample_count,
+    void *user_context
+);
+
+/**
  * @brief 注册业务层事件回调。
  */
 esp_err_t voice_service_register_callback(
     voice_service_event_callback_t callback,
+    void *user_context
+);
+
+/**
+ * @brief 注册统一麦克风 PCM 输出回调。
+ */
+esp_err_t voice_service_register_pcm_callback(
+    voice_service_pcm_callback_t callback,
     void *user_context
 );
 
@@ -80,6 +104,24 @@ esp_err_t voice_service_start(void);
  * @brief 停止持续识别任务。
  */
 esp_err_t voice_service_stop(void);
+
+/**
+ * @brief 将当前语音识别任务切换到唤醒后的连续对话采集模式。
+ *
+ * 该接口只改变采集任务的工作模式，不创建新的麦克风读取任务，
+ * 从根源上避免唤醒识别和 AI 上传同时读取 ES8311。
+ */
+void voice_service_start_conversation(void);
+
+/**
+ * @brief 退出连续对话采集模式并恢复唤醒词监听模式。
+ */
+void voice_service_stop_conversation(void);
+
+/**
+ * @brief 查询当前是否处于连续对话采集模式。
+ */
+bool voice_service_is_conversation_active(void);
 
 /**
  * @brief 查询当前语音服务状态。
