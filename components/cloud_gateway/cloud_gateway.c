@@ -397,14 +397,19 @@ static void connect_client(void)
     if (s_credentials.auth_code[0])
         snprintf(headers, sizeof(headers), "X-Device-Id: %s\r\nAuthorization: Bearer %s\r\n",
                  s_credentials.device_id, s_credentials.auth_code);
+    /*
+     * ESP-IDF 的 WebSocket 传输层会区分“没有自定义 Header”和“存在一个空 Header”。
+     * 空字符串会被传输层当作待拼接 Header，snprintf() 返回 0 后被错误判定为握手请求生成失败。
+     * 未授权的配对连接没有自定义 Header，因此必须传入 NULL；已授权连接继续传入实际 Header。
+     */
+    const char *headers_arg = headers[0] ? headers : NULL;
     esp_websocket_client_config_t config = {
-        .uri = url, .headers = headers, .disable_auto_reconnect = true,
+        .uri = url, .headers = headers_arg, .disable_auto_reconnect = true,
         .network_timeout_ms = 10000, .buffer_size = 2048, .task_stack = 6144,
         .ping_interval_sec = 20,
         .crt_bundle_attach = secure ? esp_crt_bundle_attach : NULL,
     };
     s_client = esp_websocket_client_init(&config);
-    memset(headers, 0, sizeof(headers));
     if (!s_client ||
         esp_websocket_register_events(s_client, WEBSOCKET_EVENT_ANY, ws_event, (void *)(uintptr_t)s_epoch) != ESP_OK ||
         esp_websocket_client_start(s_client) != ESP_OK) { s_restart = true; return; }

@@ -198,7 +198,7 @@ dependencies:
     - esp32p4
     version: 1.4.1
   espressif/esp_hosted:
-    component_hash: 0dbfbec0c1cbb1bb854b16aa66457bb6b70debf677903134c769ef5874669803
+    component_hash: 9eea9ce83444a412b4a02311f787f3639a5d29fe67e6df83863010dd68ab250b
     dependencies:
     - name: idf
       require: private
@@ -206,7 +206,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 2.13.1
+    version: 2.12.0
   espressif/esp_image_effects:
     component_hash: a35037db02862d3cef6f72c25f422ae62da6e6c88219ce03c9ea24e0315ceaaa
     dependencies:
@@ -596,6 +596,6 @@ direct_dependencies:
 - livekit/livekit
 - tempotian/av_render
 - tempotian/media_lib_sal
-manifest_hash: 06ae10da1231c3a6d9e0591378d046069e5d51da702388d89056d53899e440e1
+manifest_hash: 07980f48bb5d4ec5616ffd933b2ac5317485ca77c60d7ae058e98de8cc3d5c2a
 target: esp32p4
 version: 3.0.0
