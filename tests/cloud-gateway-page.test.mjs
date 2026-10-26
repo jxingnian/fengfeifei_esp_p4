@@ -17,10 +17,9 @@ for (const id of [...html.matchAll(/id='([^']+)'/g)].map(match => match[1]))
 const requests = [];
 let snapshot = {
     state: 3, paired: false, connected: true,
-    serverUrl: 'https://example.com', tenantId: '',
-    deviceUid: 'p4c5-001122334455', deviceId: '', pairingId: 'pending-a',
-    pairingCode: '012345',
-    message: '已连接后台，请在设备页面查看授权码并在后台或小程序输入',
+    serverUrl: 'https://example.com',
+    deviceUid: 'p4c5-001122334455', deviceId: '',
+    message: '已连接后台，请在后台或小程序查看配对码，再在设备页面输入',
 };
 let failNext = false;
 const context = vm.createContext({
@@ -44,22 +43,19 @@ vm.runInContext(script, context);
 await vm.runInContext('refresh()', context);
 assert.equal(elements.get('uid').textContent, snapshot.deviceUid);
 assert.equal(elements.get('serverUrl').value, 'https://example.com');
-assert.equal(elements.get('pairingCode').textContent, snapshot.pairingCode);
-
 elements.get('serverUrl').value = ' https://new.example.com/ ';
-elements.get('tenantId').value = ' tenant-a ';
 vm.runInContext('configureCloud()', context);
 await new Promise(resolve => setImmediate(resolve));
 let last = requests.at(-1);
 assert.equal(last.path, '/api/cloud/configure');
-assert.deepEqual(JSON.parse(last.options.body), { serverUrl: 'https://new.example.com', tenantId: 'tenant-a' });
+assert.deepEqual(JSON.parse(last.options.body), { serverUrl: 'https://new.example.com' });
 assert.equal(last.options.headers['Content-Type'], 'application/json');
 assert.equal(last.options.headers['X-Cloud-Control'], '1');
 
-snapshot = { ...snapshot, state: 6, paired: true, deviceId: 'device-a', pairingId: '', pairingCode: '' };
+snapshot = { ...snapshot, state: 6, paired: true, deviceId: 'device-a' };
 await vm.runInContext('refresh()', context);
 assert.equal(elements.get('serverUrl').disabled, true);
-assert.equal(elements.get('tenantId').disabled, true);
+assert.equal(elements.get('pairCode').disabled, true);
 assert.equal(elements.get('did').textContent, 'device-a');
 
 vm.runInContext('forgetCloud()', context);

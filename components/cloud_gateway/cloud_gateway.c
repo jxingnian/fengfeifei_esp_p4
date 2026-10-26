@@ -22,7 +22,7 @@
 
 /* Only worker owns client/storage. Callback copies bounded messages to queue.
  * Epochs prevent queued traffic from an old connection reaching a new session. */
-typedef enum { CMD_CONFIG, CMD_FORGET, CMD_SEND, EV_OPEN, EV_CLOSE, EV_DATA } item_type_t;
+typedef enum { CMD_CONFIG, CMD_FORGET, CMD_PAIR, CMD_SEND, EV_OPEN, EV_CLOSE, EV_DATA } item_type_t;
 typedef struct {
     item_type_t type;
     unsigned epoch;
@@ -136,20 +136,26 @@ static esp_err_t enqueue(item_type_t type, bool binary, const void *data, size_t
     return ESP_OK;
 }
 
-esp_err_t cloud_gateway_configure(const char *url, const char *tenant)
+esp_err_t cloud_gateway_configure(const char *url)
 {
-    if (!cloud_gateway_valid_url(url) || !tenant || strlen(tenant) >= CLOUD_GATEWAY_TENANT_SIZE)
+    if (!cloud_gateway_valid_url(url))
         return ESP_ERR_INVALID_ARG;
-    for (const char *p = tenant; *p; ++p)
-        if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_')) return ESP_ERR_INVALID_ARG;
     cloud_gateway_status_t status;
     if (cloud_gateway_get_status(&status) != ESP_OK) return ESP_ERR_INVALID_STATE;
-    if (status.paired && (strcmp(status.server_url, url) || strcmp(status.tenant_id, tenant)))
+    if (status.paired && strcmp(status.server_url, url))
         return ESP_ERR_INVALID_STATE;
     cloud_gateway_credentials_t value = {.version = 1};
     strlcpy(value.server_url, url, sizeof(value.server_url));
-    strlcpy(value.tenant_id, tenant, sizeof(value.tenant_id));
     return enqueue(CMD_CONFIG, false, &value, sizeof(value));
+}
+
+/* 校验并排队发送 6 位后台配对码，设备不会携带客户或用户归属。 */
+esp_err_t cloud_gateway_pair(const char *pairing_code)
+{
+    if (!pairing_code || strlen(pairing_code) != 6) return ESP_ERR_INVALID_ARG;
+    for (size_t i = 0; i < 6; ++i)
+        if (pairing_code[i] < '0' || pairing_code[i] > '9') return ESP_ERR_INVALID_ARG;
+    return enqueue(CMD_PAIR, false, pairing_code, 7);
 }
 
 esp_err_t cloud_gateway_forget(void) { return enqueue(CMD_FORGET, false, NULL, 0); }
@@ -217,8 +223,6 @@ static void disconnect_client(void)
     free(s_rx);
     s_rx = NULL;
     s_rx_length = 0;
-    s_status.pairing_id[0] = 0;
-    s_status.pairing_code[0] = 0;
     atomic_store(&s_overflow, false);
     s_deadline = 0;
 }
@@ -239,7 +243,18 @@ static void send_hello(void)
     /* Hardware capability advertisement; streaming services are separate. */
     const char *capabilities[] = {"microphone", "speaker"};
     cJSON_AddItemToObject(root, "capabilities", cJSON_CreateStringArray(capabilities, 2));
-    if (s_credentials.tenant_id[0]) cJSON_AddStringToObject(root, "tenantId", s_credentials.tenant_id);
+    char *json = cJSON_PrintUnformatted(root);
+    if (!json || !send_text(json)) s_restart = true;
+    free(json);
+    cJSON_Delete(root);
+}
+
+/* 设备网页输入配对码后，通过当前临时连接提交给后台；后台根据配对码确定客户归属。 */
+static void send_pair_code(const char *pairing_code)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "pair");
+    cJSON_AddStringToObject(root, "code", pairing_code);
     char *json = cJSON_PrintUnformatted(root);
     if (!json || !send_text(json)) s_restart = true;
     free(json);
@@ -268,19 +283,19 @@ static void receive_message(const item_t *item)
         if (!root) { s_restart = true; return; }
         const char *type = string_field(root, "type");
         if (!s_credentials.auth_code[0] && !strcmp(type, "pairing_pending")) {
-            strlcpy(s_status.pairing_id, string_field(root, "pairingId"), sizeof(s_status.pairing_id));
-            strlcpy(s_status.pairing_code, string_field(root, "code"), sizeof(s_status.pairing_code));
             s_deadline = 0;
             s_backoff = 1;
-            publish(CLOUD_GATEWAY_WAIT_CODE, "已连接后台，请在设备页面查看授权码并在后台或小程序输入");
+            publish(CLOUD_GATEWAY_WAIT_CODE, "已连接后台，请在后台或小程序查看配对码，再在此页面输入");
         } else if (!s_credentials.auth_code[0] &&
                    !strcmp(type, "paired")) {
             const char *id = string_field(root, "deviceId"), *auth = string_field(root, "deviceAuthCode");
+            const char *tenant = string_field(root, "tenantId");
             if (credential_field(id, sizeof(s_credentials.device_id)) &&
                 credential_field(auth, sizeof(s_credentials.auth_code))) {
                 cloud_gateway_credentials_t next = s_credentials;
                 strlcpy(next.device_id, id, sizeof(next.device_id));
                 strlcpy(next.auth_code, auth, sizeof(next.auth_code));
+                if (tenant[0] && credential_field(tenant, sizeof(next.tenant_id))) strlcpy(next.tenant_id, tenant, sizeof(next.tenant_id));
                 if (cloud_gateway_storage_save(&next) == ESP_OK) {
                     s_credentials = next;
                     s_immediate = true;
@@ -318,7 +333,7 @@ static void receive_message(const item_t *item)
                 s_restart = true;
                 publish(CLOUD_GATEWAY_ERROR, "认证失败，授权仍保留；请检查后台客户状态后重新连接");
             } else {
-                bool waiting_code = !s_credentials.auth_code[0] && s_status.pairing_id[0];
+                bool waiting_code = !s_credentials.auth_code[0] && s_status.state == CLOUD_GATEWAY_WAIT_CODE;
                 if (waiting_code) s_deadline = 0;
                 publish(waiting_code ? CLOUD_GATEWAY_WAIT_CODE : s_status.state,
                         string_field(root, "message"));
@@ -357,7 +372,14 @@ static void process_item(item_t *item)
             publish(CLOUD_GATEWAY_CONNECTING, "本地授权已清除，后台记录需由管理员撤销");
         } else publish(s_status.state, "清除本地授权失败");
     } else if (item->epoch != s_epoch || s_restart) return;
-    else if (item->type == EV_OPEN) {
+    else if (item->type == CMD_PAIR) {
+        /* 配对码只能在临时连接已建立且设备尚未授权时提交。 */
+        if (s_credentials.auth_code[0] || !s_open) publish(s_status.state, "当前状态不允许提交配对码");
+        else {
+            send_pair_code((const char *)item->data);
+            publish(CLOUD_GATEWAY_PAIRING, "配对码已提交，等待后台确认");
+        }
+    } else if (item->type == EV_OPEN) {
         s_open = true;
         s_deadline = now_ms() + 30000;
         publish(CLOUD_GATEWAY_CONNECTING, "服务器已连接，等待确认");
@@ -422,7 +444,7 @@ static void worker(void *arg)
             s_backoff = s_immediate ? 1 : s_backoff < 30 ? s_backoff * 2 : 60;
             s_immediate = false;
             publish(s_halted ? CLOUD_GATEWAY_ERROR : CLOUD_GATEWAY_RETRY,
-                    s_halted ? NULL : "连接已断开，将自动重连；重新连接后请使用设备显示的新授权码");
+                    s_halted ? NULL : "连接已断开，将自动重连；未完成配对时请在设备网页重新输入后台生成的配对码");
         }
         if (s_halted) continue;
         if (!network) { publish(CLOUD_GATEWAY_WAIT_NETWORK, "请先连接 Wi-Fi"); continue; }

@@ -26,7 +26,7 @@ typedef enum {
     CLOUD_GATEWAY_ERROR,
 } cloud_gateway_state_t;
 
-/* 仅供本地配网页面使用；pairing_code 是一次性临时授权码，长期授权码不在状态结构中。 */
+/* 仅供本地配网页面使用；设备不会显示后台生成的配对码，只负责提交用户输入的配对码。 */
 typedef struct {
     cloud_gateway_state_t state;
     bool paired;
@@ -35,9 +35,6 @@ typedef struct {
     char tenant_id[CLOUD_GATEWAY_TENANT_SIZE];
     char device_uid[40];
     char device_id[65];
-    char pairing_id[65];
-    /* 临时授权码仅用于设备本地显示，长期授权码不会进入状态结构。 */
-    char pairing_code[7];
     char message[192];
     uint32_t retry_seconds;
 } cloud_gateway_status_t;
@@ -59,9 +56,10 @@ typedef struct {
  * Starts once; owns reconnects and TLS. Independent of voice/camera components. */
 esp_err_t cloud_gateway_start(const cloud_gateway_config_t *config);
 esp_err_t cloud_gateway_get_status(cloud_gateway_status_t *status);
-/* Asynchronous commands; ESP_OK means queued, inspect status for final result.
- * Changing server/tenant while paired is rejected: explicitly forget first. */
-esp_err_t cloud_gateway_configure(const char *server_url, const char *tenant_id);
+/* 异步保存后台地址；客户归属只能由后台配对码决定，设备不再配置客户 ID。 */
+esp_err_t cloud_gateway_configure(const char *server_url);
+/* 异步把本地网页输入的后台配对码发送给临时 WebSocket。 */
+esp_err_t cloud_gateway_pair(const char *pairing_code);
 /* Clears local credentials only; does not revoke the backend record. */
 esp_err_t cloud_gateway_forget(void);
 /* Bounded, nonblocking enqueue, available only after ready. Never exposes auth. */
