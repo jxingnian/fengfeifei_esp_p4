@@ -32,3 +32,13 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)
 project(p4_c5_network)
+
+# ESP-IDF 6.1 的 RISC-V 头文件在启用 -Wconversion 时会产生 sign-conversion
+# 警告；livekit 组件的 CMake 配置继承了工程的 -Werror，因此该工具链兼容性
+# 警告会被错误地当成 livekit 源码错误。这里仅对 livekit 目标关闭该类警告
+# 的“警告即错误”行为，不修改 ESP-IDF、managed_components 或生成的构建文件，
+# 其余组件仍然保持全局 -Werror 检查。
+idf_component_get_property(_livekit_component_lib livekit__livekit COMPONENT_LIB)
+if(_livekit_component_lib)
+    target_compile_options(${_livekit_component_lib} PRIVATE "-Wno-error=sign-conversion")
+endif()

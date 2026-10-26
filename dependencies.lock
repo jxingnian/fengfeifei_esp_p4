@@ -220,7 +220,7 @@ dependencies:
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.0.1
   espressif/esp_ipa:
@@ -378,28 +378,9 @@ dependencies:
     component_hash: f9a6459cceae333fe914630138c13ae3dcc28f7cb6f68c664a05817eb8e96301
     dependencies: []
     source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 0.7.10
-  espressif/gmf_video:
-    component_hash: f846518801ae7e748ecde24e5ac4b21518ca42fffb533b9d9d67a4cd7ed2c3b8
-    dependencies:
-    - name: espressif/esp_image_effects
-      registry_url: https://components.espressif.com
-      require: private
-      version: ~1.0.0
-    - name: espressif/esp_video_codec
-      registry_url: https://components.espressif.com
-      require: private
-      version: ~0.5.2
-    - name: espressif/gmf_core
-      registry_url: https://components.espressif.com
-      require: private
-      version: ~0.7.0
-    source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 0.7.1
+    version: 0.7.10
   espressif/usb:
     component_hash: 99eee72ea224d9117d4c342442717a1f20bf8112e2ab5d7d7038b827874f4c92
     dependencies:
@@ -455,6 +436,12 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.3.3
+  gmf_video:
+    dependencies: []
+    source:
+      path: components/gmf_video
+      type: local
+    version: 0.7.1
   idf:
     source:
       type: idf
@@ -514,6 +501,12 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.4.9~2
+  media_lib_sal:
+    dependencies: []
+    source:
+      path: components/media_lib_sal
+      type: local
+    version: 0.9.1
   tempotian/av_render:
     dependencies:
     - name: espressif/esp_audio_codec
@@ -530,13 +523,6 @@ dependencies:
       path: components/av_render
       type: local
     version: 0.9.1
-  tempotian/media_lib_sal:
-    component_hash: 6e7f5b5bf826e3e133162099c6e041559f19675fcbec214f7f92bba21708a004
-    dependencies: []
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.9.1
 direct_dependencies:
 - espressif/cmake_utilities
 - espressif/esp-sr
@@ -547,6 +533,7 @@ direct_dependencies:
 - espressif/esp_codec_dev
 - espressif/esp_h264
 - espressif/esp_hosted
+- espressif/esp_image_effects
 - espressif/esp_ipa
 - espressif/esp_muxer
 - espressif/esp_video
@@ -554,12 +541,13 @@ direct_dependencies:
 - espressif/esp_websocket_client
 - espressif/esp_wifi_remote
 - espressif/gmf_audio
+- espressif/gmf_core
 - espressif/gmf_video
 - espressif/usb_host_uvc
 - idf
 - livekit/livekit
 - tempotian/av_render
 - tempotian/media_lib_sal
-manifest_hash: 2b1ede4826d48e37543efa16e261c84902960a4a307c03936661fc909becca10
+manifest_hash: 3eb925ef5ccf851fbe71c7325d7ea5a7b9c0251181c3576b61d71aef05a19d56
 target: esp32p4
 version: 3.0.0
