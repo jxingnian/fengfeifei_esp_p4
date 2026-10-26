@@ -35,6 +35,8 @@ esp_err_t voice_board_audio_read(int16_t *samples, size_t sample_count);
 esp_err_t voice_board_audio_write(const int16_t *samples, size_t sample_count);
 
 esp_err_t voice_board_audio_set_output_enabled(bool enabled);
+/** Flush the bounded DMA ring with silence before turning off the amplifier. */
+esp_err_t voice_board_audio_drain(void);
 
 /* Borrowed handles; only use after voice_service_stop() has completed.
  * Camera SCCB and ES8311 share I2C1 GPIO7/8. Never delete these handles. */

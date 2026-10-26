@@ -1,0 +1,32 @@
+menu "AI voice turn and playback"
+    config VOICE_AI_VAD_MODE
+        int "WebRTC VAD aggressiveness (higher rejects more noise)"
+        range 0 4
+        default 3
+    config VOICE_AI_SPEAKER_VOLUME
+        int "Speaker volume (0-100)"
+        range 0 100
+        default 65
+    config VOICE_AI_SELF_TEST
+        bool "Play PCM and Opus diagnostic tones at boot"
+        default n
+        help
+            Before microphone/cloud startup, play two short low-amplitude tones.
+            First PCM, then locally encoded/decoded Opus. No network is used.
+    config VOICE_AI_TAIL_SILENCE_MS
+        int "End a turn after silence (ms)"
+        range 400 2000
+        default 800
+    config VOICE_AI_NO_SPEECH_MS
+        int "Exit listening when no speech starts (ms)"
+        range 3000 15000
+        default 5000
+    config VOICE_AI_MAX_TURN_MS
+        int "Maximum speech turn (ms)"
+        range 5000 30000
+        default 15000
+    config VOICE_AI_REPLY_TIMEOUT_MS
+        int "First audio timeout after commit (ms)"
+        range 5000 60000
+        default 10000
+endmenu

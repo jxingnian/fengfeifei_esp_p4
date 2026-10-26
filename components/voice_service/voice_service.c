@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 #include "esp_log.h"
 #include "esp_mn_iface.h"
@@ -42,9 +43,9 @@ static esp_mn_iface_t *s_multinet;
 static model_iface_data_t *s_multinet_data;
 static bool s_commands_allocated;
 static TaskHandle_t s_recognition_task;
-static volatile bool s_running;
-static volatile bool s_conversation_active;
-static voice_service_state_t s_state = VOICE_SERVICE_STATE_STOPPED;
+static atomic_bool s_running;
+static atomic_bool s_conversation_active;
+static _Atomic voice_service_state_t s_state = VOICE_SERVICE_STATE_STOPPED;
 static voice_service_event_callback_t s_callback;
 static void *s_callback_context;
 static voice_service_pcm_callback_t s_pcm_callback;

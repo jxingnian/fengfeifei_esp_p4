@@ -24,6 +24,8 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #ifndef CONFIG_VOICE_SERVICE_MIC_GAIN_DB
 #define CONFIG_VOICE_SERVICE_MIC_GAIN_DB 24
@@ -53,6 +55,13 @@ static const audio_codec_if_t *s_codec_if;
 static esp_codec_dev_handle_t s_microphone;
 static esp_codec_dev_handle_t s_speaker;
 static bool s_initialized;
+
+static esp_err_t restore_output_level(void)
+{
+    esp_err_t error = esp_codec_dev_set_out_vol(s_speaker, CONFIG_VOICE_AI_SPEAKER_VOLUME);
+    if (error == ESP_OK) error = esp_codec_dev_set_out_mute(s_speaker, false);
+    return error;
+}
 
 /**
  * @brief 释放已经创建的 I2S 和 codec 接口。
@@ -129,6 +138,8 @@ static esp_err_t voice_board_audio_init_i2s(void)
     i2s_chan_config_t channel_config =
         I2S_CHANNEL_DEFAULT_CONFIG(AUDIO_I2S_PORT, I2S_ROLE_MASTER);
     channel_config.auto_clear = true;
+    channel_config.dma_desc_num = 6;
+    channel_config.dma_frame_num = 160;
 
     esp_err_t error = i2s_new_channel(
         &channel_config,
@@ -265,6 +276,9 @@ static esp_err_t voice_board_audio_init_codec(void)
     }
     error = esp_codec_dev_open(s_speaker, &sample_info);
     if (error != ESP_OK) return error;
+    error = restore_output_level();
+    if (error != ESP_OK) return error;
+    ESP_LOGI(TAG, "ES8311 speaker volume=%d, unmuted", CONFIG_VOICE_AI_SPEAKER_VOLUME);
 
     /*
      * 官方开发板录音示例提供 24 dB 麦克风增益选项。这里在设备打开后
@@ -335,7 +349,21 @@ esp_err_t voice_board_audio_write(const int16_t *samples, size_t sample_count)
 esp_err_t voice_board_audio_set_output_enabled(bool enabled)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (enabled) {
+        esp_err_t error = restore_output_level();
+        if (error != ESP_OK) return error;
+    }
     return gpio_set_level(AUDIO_PA_GPIO, enabled ? 1 : 0);
+}
+
+esp_err_t voice_board_audio_drain(void)
+{
+    /* Six 160-sample DMA descriptors = 60ms; push silence through the whole
+     * ring then wait one more ring before disabling PA. Caller owns output. */
+    static const int16_t silence[960] = {0};
+    esp_err_t error = voice_board_audio_write(silence, 960);
+    if (error == ESP_OK) vTaskDelay(pdMS_TO_TICKS(70));
+    return error;
 }
 
 i2c_master_bus_handle_t voice_board_audio_i2c_bus(void) { return s_i2c_bus; }
@@ -353,6 +381,7 @@ esp_err_t voice_board_audio_restore(void)
     esp_err_t error = esp_codec_dev_open(s_microphone, &info);
     if (error == ESP_OK) error = esp_codec_dev_open(s_speaker, &info);
     if (error == ESP_OK) error = esp_codec_dev_set_in_gain(s_microphone, CONFIG_VOICE_SERVICE_MIC_GAIN_DB);
+    if (error == ESP_OK) error = restore_output_level();
     (void)voice_board_audio_set_output_enabled(false);
     return error;
 }

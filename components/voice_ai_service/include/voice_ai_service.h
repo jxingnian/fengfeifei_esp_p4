@@ -17,6 +17,8 @@ extern "C" {
  * 不负责设备配对，也不直接保存或访问 Coze Token。Token 始终只保留在后台。
  */
 esp_err_t voice_ai_service_init(void);
+/** Startup-only PCM then Opus tone test; microphone/RTC must be stopped. */
+esp_err_t voice_ai_service_audio_self_test(void);
 
 /**
  * @brief 处理本地 MultiNet 已检测到唤醒词的事件。
@@ -30,7 +32,7 @@ void voice_ai_service_on_wake_detected(void);
  * @brief 接收统一麦克风采集任务输出的一帧 PCM 数据。
  *
  * 数据格式由设备硬件固定为 16 kHz、单声道、16 bit little-endian PCM。
- * 函数只在 AI 会话采集中拼接 60ms PCM 并零等待入队，不执行 Opus 编码、
+ * 函数只在本轮监听中拼接 60ms PCM 并零等待入队，不执行 Opus 编码、
  * 网络发送或播放；编码和发送入队交给独立的大栈任务。
  */
 void voice_ai_service_on_pcm(const int16_t *samples, size_t sample_count, void *context);

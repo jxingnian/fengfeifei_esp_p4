@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "voice_ai_service.c"
+        "voice_audio_test.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -11,4 +12,5 @@ idf_component_register(
         freertos
         esp_timer
         esp_audio_codec
+        esp-sr
 )

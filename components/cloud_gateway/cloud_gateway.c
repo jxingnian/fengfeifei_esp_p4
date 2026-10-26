@@ -56,6 +56,7 @@ static size_t s_audio_tx_bytes;
 static int64_t s_audio_rate_log_ms;
 static uint64_t s_rx_sequence;
 static atomic_uint s_audio_generation;
+static atomic_uint s_tx_sequence;
 static bool s_open, s_restart, s_halted, s_immediate;
 static int64_t s_deadline, s_next;
 static unsigned s_backoff = 1;
@@ -180,12 +181,14 @@ esp_err_t cloud_gateway_pair(const char *pairing_code)
 
 esp_err_t cloud_gateway_forget(void) { return enqueue(CMD_FORGET, false, NULL, 0); }
 
-esp_err_t cloud_gateway_send(bool binary, const void *data, size_t length)
+static esp_err_t send_ordered(bool binary, const void *data, size_t length, bool barrier)
 {
     if (!data || !length || length > CLOUD_GATEWAY_MAX_MESSAGE) return ESP_ERR_INVALID_ARG;
     if (!s_control_tx_queue) return ESP_ERR_INVALID_STATE;
     item_t item = {.type = CMD_SEND, .binary = binary, .length = length};
     item.audio_generation = atomic_load(&s_audio_generation);
+    item.audio_barrier = barrier;
+    item.sequence = atomic_fetch_add(&s_tx_sequence, 1);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     item.epoch = s_epoch;
     bool ready = s_view.state == CLOUD_GATEWAY_READY;
@@ -213,6 +216,18 @@ esp_err_t cloud_gateway_send(bool binary, const void *data, size_t length)
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
+}
+
+esp_err_t cloud_gateway_send(bool binary, const void *data, size_t length)
+{
+    return send_ordered(binary, data, length, false);
+}
+
+esp_err_t cloud_gateway_send_audio_end(const void *data, size_t length)
+{
+    /* The encoder is the sole producer of a turn: enqueue after its last packet.
+     * The worker drains earlier audio before this control, including failed sends. */
+    return send_ordered(false, data, length, true);
 }
 
 void cloud_gateway_discard_audio(void)
@@ -474,7 +489,8 @@ static void process_item(item_t *item)
     } else if (item->type == EV_CLOSE) s_restart = true;
     else if (item->type == EV_DATA) receive_message(item);
     else if (item->type == CMD_SEND && s_status.state == CLOUD_GATEWAY_READY) {
-        if (item->binary && item->audio_generation != atomic_load(&s_audio_generation)) return;
+        if ((item->binary || item->audio_barrier) &&
+            item->audio_generation != atomic_load(&s_audio_generation)) return;
         int sent = item->binary
             ? esp_websocket_client_send_bin(s_client, item->data, item->length, pdMS_TO_TICKS(2000))
             : esp_websocket_client_send_text(s_client, item->data, item->length, pdMS_TO_TICKS(2000));
@@ -486,6 +502,8 @@ static void process_item(item_t *item)
         } else if (item->binary) {
             s_audio_tx_bytes += item->length;
             atomic_fetch_add(&s_audio_tx_sent, 1);
+        } else if (item->audio_barrier) {
+            ESP_LOGI(TAG, "Ordered audio commit sent after uplink drain");
         }
     }
 }
@@ -496,7 +514,7 @@ static void connect_client(void)
     char url[512], headers[256] = "";
     bool secure = !strncmp(s_credentials.server_url, "https://", 8);
     snprintf(url, sizeof(url), "%s://%s/ws/device%s", secure ? "wss" : "ws",
-             s_credentials.server_url + (secure ? 8 : 7), s_credentials.auth_code[0] ? "" : "/pair");
+             s_credentials.server_url + (secure ? 8 : 7), s_credentials.auth_code[0] ? "?voiceProtocol=2" : "/pair");
     if (s_credentials.auth_code[0])
         snprintf(headers, sizeof(headers), "X-Device-Id: %s\r\nAuthorization: Bearer %s\r\n",
                  s_credentials.device_id, s_credentials.auth_code);
@@ -539,12 +557,32 @@ static void worker(void *arg)
                 /* audio_end 必须在它之前的二进制音频交付业务层后再交付。 */
                 queue = s_audio_rx_queue;
             }
+            if (queue == s_control_tx_queue &&
+                xQueuePeek(s_control_tx_queue, &control_head, 0) == pdTRUE && control_head.audio_barrier &&
+                xQueuePeek(s_audio_tx_queue, &audio_head, 0) == pdTRUE &&
+                audio_head.sequence < control_head.sequence) {
+                queue = s_audio_tx_queue;
+            }
         } else if (uxQueueMessagesWaiting(s_audio_rx_queue)) {
             queue = s_audio_rx_queue;
         } else {
             queue = s_audio_tx_queue;
         }
         if (xQueueReceive(queue, &item, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (queue == s_audio_tx_queue) {
+                /* Audio may wake the worker while it was waiting on an empty
+                 * audio queue. Re-check controls that arrived during that wait,
+                 * especially audio_start: append must never precede clear/start.
+                 * An ordered commit still cannot overtake this dequeued packet. */
+                item_t control_head;
+                while (xQueuePeek(s_control_tx_queue, &control_head, 0) == pdTRUE &&
+                       (!control_head.audio_barrier || control_head.sequence < item.sequence)) {
+                    item_t control;
+                    if (xQueueReceive(s_control_tx_queue, &control, 0) != pdTRUE) break;
+                    process_item(&control);
+                    if (control.data) { memset(control.data, 0, control.length); free(control.data); }
+                }
+            }
             if (queue == s_audio_rx_queue) {
                 item_t control_head;
                 while (xQueuePeek(s_control_rx_queue, &control_head, 0) == pdTRUE &&

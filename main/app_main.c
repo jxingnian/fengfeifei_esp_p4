@@ -126,6 +126,10 @@ void app_main(void)
         return;
     }
 
+#ifdef CONFIG_VOICE_AI_SELF_TEST
+    ESP_ERROR_CHECK(voice_ai_service_audio_self_test());
+#endif
+
     /* Initialize the call queue/camera before accepting cloud messages, and
      * before the voice task begins using the shared codec/I2C resources. */
     error = call_service_init(send_call_media);

@@ -71,6 +71,8 @@ esp_err_t cloud_gateway_pair(const char *pairing_code);
 esp_err_t cloud_gateway_forget(void);
 /* Bounded, nonblocking enqueue, available only after ready. Never exposes auth. */
 esp_err_t cloud_gateway_send(bool binary, const void *data, size_t length);
+/** Ordered turn commit: all previously enqueued audio is sent or discarded first. */
+esp_err_t cloud_gateway_send_audio_end(const void *data, size_t length);
 /* 丢弃尚未发送的旧上行音频；不影响控制消息或已在发送中的 WebSocket 帧。 */
 void cloud_gateway_discard_audio(void);
 /* Attach separate cloud routes/panel to the existing provisioning HTTP server. */
