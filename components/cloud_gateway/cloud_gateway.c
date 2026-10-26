@@ -389,7 +389,8 @@ static void process_item(item_t *item)
 
 static void connect_client(void)
 {
-    char url[CLOUD_GATEWAY_URL_SIZE + 32], headers[256] = "";
+    /* 预留协议、路径和编译器可见的完整源字符串上限，确保 URL 不被截断。 */
+    char url[512], headers[256] = "";
     bool secure = !strncmp(s_credentials.server_url, "https://", 8);
     snprintf(url, sizeof(url), "%s://%s/ws/device%s", secure ? "wss" : "ws",
              s_credentials.server_url + (secure ? 8 : 7), s_credentials.auth_code[0] ? "" : "/pair");
