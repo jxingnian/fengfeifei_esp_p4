@@ -32,8 +32,15 @@ typedef struct {
     bool binary;
     size_t length;
     void *data;
+    uint64_t sequence;
+    bool audio_barrier;
+    bool urgent;
+    unsigned audio_generation;
 } item_t;
-static QueueHandle_t s_queue;
+static QueueHandle_t s_control_tx_queue;
+static QueueHandle_t s_audio_tx_queue;
+static QueueHandle_t s_control_rx_queue;
+static QueueHandle_t s_audio_rx_queue;
 static SemaphoreHandle_t s_mutex;
 static cloud_gateway_status_t s_status, s_view;
 static cloud_gateway_credentials_t s_credentials;
@@ -41,6 +48,14 @@ static cloud_gateway_config_t s_config;
 static esp_websocket_client_handle_t s_client;
 static unsigned s_epoch;
 static atomic_bool s_overflow;
+static atomic_uint s_audio_tx_dropped;
+static atomic_uint s_audio_rx_dropped;
+static atomic_uint s_audio_tx_sent;
+static atomic_uint s_audio_tx_failed;
+static size_t s_audio_tx_bytes;
+static int64_t s_audio_rate_log_ms;
+static uint64_t s_rx_sequence;
+static atomic_uint s_audio_generation;
 static bool s_open, s_restart, s_halted, s_immediate;
 static int64_t s_deadline, s_next;
 static unsigned s_backoff = 1;
@@ -112,7 +127,7 @@ static void publish(cloud_gateway_state_t state, const char *message)
 esp_err_t cloud_gateway_get_status(cloud_gateway_status_t *status)
 {
     if (!status) return ESP_ERR_INVALID_ARG;
-    if (!s_queue) return ESP_ERR_INVALID_STATE;
+    if (!s_control_tx_queue) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *status = s_view;
     xSemaphoreGive(s_mutex);
@@ -121,7 +136,7 @@ esp_err_t cloud_gateway_get_status(cloud_gateway_status_t *status)
 
 static esp_err_t enqueue(item_type_t type, bool binary, const void *data, size_t length)
 {
-    if (!s_queue) return ESP_ERR_INVALID_STATE;
+    if (!s_control_tx_queue) return ESP_ERR_INVALID_STATE;
     item_t item = {.type = type, .binary = binary, .length = length};
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     item.epoch = s_epoch;
@@ -133,7 +148,7 @@ static esp_err_t enqueue(item_type_t type, bool binary, const void *data, size_t
         if (!item.data) return ESP_ERR_NO_MEM;
         memcpy(item.data, data, length);
     }
-    if (xQueueSend(s_queue, &item, 0) != pdTRUE) {
+    if (xQueueSend(s_control_tx_queue, &item, 0) != pdTRUE) {
         free(item.data);
         ESP_LOGW(TAG, "后台上行队列已满：type=%d，length=%u", (int)type, (unsigned)length);
         return ESP_ERR_TIMEOUT;
@@ -168,7 +183,47 @@ esp_err_t cloud_gateway_forget(void) { return enqueue(CMD_FORGET, false, NULL, 0
 esp_err_t cloud_gateway_send(bool binary, const void *data, size_t length)
 {
     if (!data || !length || length > CLOUD_GATEWAY_MAX_MESSAGE) return ESP_ERR_INVALID_ARG;
-    return enqueue(CMD_SEND, binary, data, length);
+    if (!s_control_tx_queue) return ESP_ERR_INVALID_STATE;
+    item_t item = {.type = CMD_SEND, .binary = binary, .length = length};
+    item.audio_generation = atomic_load(&s_audio_generation);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    item.epoch = s_epoch;
+    bool ready = s_view.state == CLOUD_GATEWAY_READY;
+    xSemaphoreGive(s_mutex);
+    if (!ready) return ESP_ERR_INVALID_STATE;
+    item.data = malloc(length);
+    if (!item.data) return ESP_ERR_NO_MEM;
+    memcpy(item.data, data, length);
+    QueueHandle_t queue = binary ? s_audio_tx_queue : s_control_tx_queue;
+    if (xQueueSend(queue, &item, 0) == pdTRUE) return ESP_OK;
+    if (!binary) {
+        free(item.data);
+        ESP_LOGW(TAG, "后台控制上行队列已满：length=%u", (unsigned)length);
+        return ESP_ERR_TIMEOUT;
+    }
+    /* 参考小智：实时音频队列满时淘汰最旧包，保留最新语音。 */
+    item_t old = {0};
+    if (xQueueReceive(queue, &old, 0) == pdTRUE) {
+        free(old.data);
+        atomic_fetch_add(&s_audio_tx_dropped, 1);
+    }
+    if (xQueueSend(queue, &item, 0) != pdTRUE) {
+        free(item.data);
+        atomic_fetch_add(&s_audio_tx_dropped, 1);
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+void cloud_gateway_discard_audio(void)
+{
+    atomic_fetch_add(&s_audio_generation, 1);
+    if (!s_audio_tx_queue) return;
+    item_t item;
+    while (xQueueReceive(s_audio_tx_queue, &item, 0) == pdTRUE) {
+        free(item.data);
+        atomic_fetch_add(&s_audio_tx_dropped, 1);
+    }
 }
 
 static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *event)
@@ -198,16 +253,40 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *event)
         s_rx_length += d->data_len;
         if (!d->fin || d->payload_offset + d->data_len != d->payload_len) return;
         s_rx[s_rx_length] = 0;
+        /* 重组缓冲上限 16KB，但入队只保留真实包长，避免小 Opus 包每项占 16KB。 */
+        char *compact = realloc(s_rx, s_rx_length + 1);
+        if (compact) s_rx = compact;
         item.type = EV_DATA;
         item.binary = s_rx_opcode == 2;
         item.data = s_rx;
         item.length = s_rx_length;
+        item.sequence = ++s_rx_sequence;
+        if (!item.binary) {
+            cJSON *root = cJSON_ParseWithLength(item.data, item.length);
+            const char *type = root ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "type")) : NULL;
+            item.audio_barrier = type && !strcmp(type, "audio_end");
+            item.urgent = type && (!strcmp(type, "audio_stop") || !strcmp(type, "error"));
+            cJSON_Delete(root);
+        }
         s_rx = NULL;
         s_rx_length = 0;
     } else return;
-    if (xQueueSend(s_queue, &item, pdMS_TO_TICKS(100)) != pdTRUE) {
+    QueueHandle_t queue = item.type == EV_DATA && item.binary ? s_audio_rx_queue : s_control_rx_queue;
+    BaseType_t queued = item.urgent ? xQueueSendToFront(queue, &item, 0) : xQueueSend(queue, &item, 0);
+    if (queued != pdTRUE) {
+        if (item.type == EV_DATA && item.binary) {
+            item_t old = {0};
+            if (xQueueReceive(queue, &old, 0) == pdTRUE) {
+                free(old.data);
+                atomic_fetch_add(&s_audio_rx_dropped, 1);
+            }
+            if (xQueueSend(queue, &item, 0) == pdTRUE) return;
+            atomic_fetch_add(&s_audio_rx_dropped, 1);
+            free(item.data);
+            return; /* 单个音频入队失败不触发连接重建。 */
+        }
         free(item.data);
-        ESP_LOGE(TAG, "后台下行接收队列已满，准备重建 WebSocket：binary=%d，length=%u",
+        ESP_LOGE(TAG, "后台下行控制队列已满，准备重建 WebSocket：binary=%d，length=%u",
                  item.binary ? 1 : 0, (unsigned)item.length);
         atomic_store(&s_overflow, true);
     }
@@ -395,13 +474,18 @@ static void process_item(item_t *item)
     } else if (item->type == EV_CLOSE) s_restart = true;
     else if (item->type == EV_DATA) receive_message(item);
     else if (item->type == CMD_SEND && s_status.state == CLOUD_GATEWAY_READY) {
+        if (item->binary && item->audio_generation != atomic_load(&s_audio_generation)) return;
         int sent = item->binary
             ? esp_websocket_client_send_bin(s_client, item->data, item->length, pdMS_TO_TICKS(2000))
             : esp_websocket_client_send_text(s_client, item->data, item->length, pdMS_TO_TICKS(2000));
         if (sent != (int)item->length) {
-            ESP_LOGE(TAG, "后台上行 WebSocket 发送不完整：binary=%d，expected=%u，sent=%d",
+            ESP_LOGW(TAG, "后台上行 WebSocket 发送不完整：binary=%d，expected=%u，sent=%d",
                      item->binary ? 1 : 0, (unsigned)item->length, sent);
-            s_restart = true;
+            if (item->binary) atomic_fetch_add(&s_audio_tx_failed, 1);
+            else s_restart = true;
+        } else if (item->binary) {
+            s_audio_tx_bytes += item->length;
+            atomic_fetch_add(&s_audio_tx_sent, 1);
         }
     }
 }
@@ -440,11 +524,55 @@ static void worker(void *arg)
 {
     (void)arg;
     bool time_started = false;
+    s_audio_rate_log_ms = now_ms();
     for (;;) {
         item_t item;
-        if (xQueueReceive(s_queue, &item, pdMS_TO_TICKS(200)) == pdTRUE) {
+        QueueHandle_t queue = NULL;
+        /* 控制优先：音频不能阻塞 ready/audio_start/cancel 等控制面。 */
+        if (uxQueueMessagesWaiting(s_control_rx_queue) || uxQueueMessagesWaiting(s_control_tx_queue)) {
+            queue = uxQueueMessagesWaiting(s_control_rx_queue) ? s_control_rx_queue : s_control_tx_queue;
+            item_t control_head, audio_head;
+            if (queue == s_control_rx_queue &&
+                xQueuePeek(s_control_rx_queue, &control_head, 0) == pdTRUE && control_head.audio_barrier &&
+                xQueuePeek(s_audio_rx_queue, &audio_head, 0) == pdTRUE &&
+                audio_head.sequence < control_head.sequence) {
+                /* audio_end 必须在它之前的二进制音频交付业务层后再交付。 */
+                queue = s_audio_rx_queue;
+            }
+        } else if (uxQueueMessagesWaiting(s_audio_rx_queue)) {
+            queue = s_audio_rx_queue;
+        } else {
+            queue = s_audio_tx_queue;
+        }
+        if (xQueueReceive(queue, &item, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (queue == s_audio_rx_queue) {
+                item_t control_head;
+                while (xQueuePeek(s_control_rx_queue, &control_head, 0) == pdTRUE &&
+                       (!control_head.audio_barrier || control_head.sequence < item.sequence)) {
+                    item_t control;
+                    if (xQueueReceive(s_control_rx_queue, &control, 0) != pdTRUE) break;
+                    process_item(&control);
+                    if (control.data) { memset(control.data, 0, control.length); free(control.data); }
+                }
+            }
             process_item(&item);
             if (item.data) { memset(item.data, 0, item.length); free(item.data); }
+        }
+        int64_t now = now_ms();
+        if (now - s_audio_rate_log_ms >= 5000) {
+            unsigned frames = atomic_exchange(&s_audio_tx_sent, 0);
+            unsigned dropped = atomic_exchange(&s_audio_tx_dropped, 0);
+            unsigned failed = atomic_exchange(&s_audio_tx_failed, 0);
+            unsigned rx_dropped = atomic_exchange(&s_audio_rx_dropped, 0);
+            if (frames || dropped || failed || rx_dropped || uxQueueMessagesWaiting(s_audio_tx_queue)) {
+                ESP_LOGI(TAG, "AI 音频上行速率：%u 帧/%ums，%u bytes，%.2f KiB/s，TX队列=%u/%u，TX丢弃=%u，发送失败=%u，RX丢弃=%u",
+                         frames, (unsigned)(now - s_audio_rate_log_ms), (unsigned)s_audio_tx_bytes,
+                         (double)s_audio_tx_bytes * 1000.0 / (now - s_audio_rate_log_ms) / 1024.0,
+                         (unsigned)uxQueueMessagesWaiting(s_audio_tx_queue), CLOUD_GATEWAY_AUDIO_QUEUE_LENGTH,
+                         dropped, failed, rx_dropped);
+            }
+            s_audio_tx_bytes = 0;
+            s_audio_rate_log_ms = now;
         }
         bool network = wifi_provisioning_is_connected();
         if (atomic_load(&s_overflow) || (s_deadline && now_ms() >= s_deadline)) s_restart = true;
@@ -478,7 +606,7 @@ static void worker(void *arg)
 
 esp_err_t cloud_gateway_start(const cloud_gateway_config_t *config)
 {
-    if (s_queue) return ESP_ERR_INVALID_STATE;
+    if (s_control_tx_queue) return ESP_ERR_INVALID_STATE;
     esp_err_t storage_error = cloud_gateway_storage_load(&s_credentials);
     if (storage_error != ESP_OK) {
         /* Keep local recovery UI usable; never authenticate using a corrupt blob. */
@@ -493,21 +621,30 @@ esp_err_t cloud_gateway_start(const cloud_gateway_config_t *config)
     snprintf(s_status.device_uid, sizeof(s_status.device_uid), "p4c5-%02x%02x%02x%02x%02x%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     s_mutex = xSemaphoreCreateMutex();
-    s_queue = xQueueCreate(CLOUD_GATEWAY_QUEUE_LENGTH, sizeof(item_t));
-    if (!s_mutex || !s_queue) {
+    s_control_tx_queue = xQueueCreate(CLOUD_GATEWAY_CONTROL_QUEUE_LENGTH, sizeof(item_t));
+    s_audio_tx_queue = xQueueCreate(CLOUD_GATEWAY_AUDIO_QUEUE_LENGTH, sizeof(item_t));
+    s_control_rx_queue = xQueueCreate(CLOUD_GATEWAY_CONTROL_QUEUE_LENGTH, sizeof(item_t));
+    s_audio_rx_queue = xQueueCreate(CLOUD_GATEWAY_AUDIO_QUEUE_LENGTH, sizeof(item_t));
+    if (!s_mutex || !s_control_tx_queue || !s_audio_tx_queue || !s_control_rx_queue || !s_audio_rx_queue) {
         if (s_mutex) vSemaphoreDelete(s_mutex);
-        if (s_queue) vQueueDelete(s_queue);
+        if (s_control_tx_queue) vQueueDelete(s_control_tx_queue);
+        if (s_audio_tx_queue) vQueueDelete(s_audio_tx_queue);
+        if (s_control_rx_queue) vQueueDelete(s_control_rx_queue);
+        if (s_audio_rx_queue) vQueueDelete(s_audio_rx_queue);
         s_mutex = NULL;
-        s_queue = NULL;
+        s_control_tx_queue = s_audio_tx_queue = s_control_rx_queue = s_audio_rx_queue = NULL;
         return ESP_ERR_NO_MEM;
     }
     if (config) s_config = *config;
     publish(s_halted ? CLOUD_GATEWAY_ERROR : CLOUD_GATEWAY_WAIT_NETWORK,
             s_halted ? "授权存储读取失败，请检查配置后重新连接；旧授权需在后台撤销" : "等待 Wi-Fi 联网");
     if (xTaskCreate(worker, "cloud_gateway", 8192, NULL, 5, NULL) != pdPASS) {
-        vQueueDelete(s_queue);
+        vQueueDelete(s_control_tx_queue);
+        vQueueDelete(s_audio_tx_queue);
+        vQueueDelete(s_control_rx_queue);
+        vQueueDelete(s_audio_rx_queue);
         vSemaphoreDelete(s_mutex);
-        s_queue = NULL;
+        s_control_tx_queue = s_audio_tx_queue = s_control_rx_queue = s_audio_rx_queue = NULL;
         s_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }

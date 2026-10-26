@@ -30,7 +30,8 @@ void voice_ai_service_on_wake_detected(void);
  * @brief 接收统一麦克风采集任务输出的一帧 PCM 数据。
  *
  * 数据格式由设备硬件固定为 16 kHz、单声道、16 bit little-endian PCM。
- * 函数只在 AI 会话采集中执行无阻塞发送，不得在这里执行播放或等待操作。
+ * 函数只在 AI 会话采集中拼接 60ms PCM 并零等待入队，不执行 Opus 编码、
+ * 网络发送或播放；编码和发送入队交给独立的大栈任务。
  */
 void voice_ai_service_on_pcm(const int16_t *samples, size_t sample_count, void *context);
 

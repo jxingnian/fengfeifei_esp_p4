@@ -12,8 +12,11 @@ extern "C" {
 #define CLOUD_GATEWAY_URL_SIZE 192
 #define CLOUD_GATEWAY_TENANT_SIZE 65
 #define CLOUD_GATEWAY_MAX_MESSAGE 16384
-/* 网络收发任务与业务任务之间的缓冲数量；音频和控制消息仍由上层分类。 */
+/* 旧常量保留兼容；实际分别使用下面的音频和控制队列容量。 */
 #define CLOUD_GATEWAY_QUEUE_LENGTH 64
+/* 音频是实时数据：积压时丢最旧帧，不能挤占控制消息。 */
+#define CLOUD_GATEWAY_AUDIO_QUEUE_LENGTH 160
+#define CLOUD_GATEWAY_CONTROL_QUEUE_LENGTH 64
 
 typedef enum {
     CLOUD_GATEWAY_WAIT_NETWORK,
@@ -68,6 +71,8 @@ esp_err_t cloud_gateway_pair(const char *pairing_code);
 esp_err_t cloud_gateway_forget(void);
 /* Bounded, nonblocking enqueue, available only after ready. Never exposes auth. */
 esp_err_t cloud_gateway_send(bool binary, const void *data, size_t length);
+/* 丢弃尚未发送的旧上行音频；不影响控制消息或已在发送中的 WebSocket 帧。 */
+void cloud_gateway_discard_audio(void);
 /* Attach separate cloud routes/panel to the existing provisioning HTTP server. */
 esp_err_t cloud_gateway_web_register(void);
 

@@ -10,4 +10,5 @@ idf_component_register(
         cjson
         freertos
         esp_timer
+        esp_audio_codec
 )
