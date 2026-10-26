@@ -1,4 +1,10 @@
 dependencies:
+  esp_video:
+    dependencies: []
+    source:
+      path: components/esp_video
+      type: local
+    version: 2.5.0
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:
@@ -131,7 +137,7 @@ dependencies:
       require: private
       version: '>=5.3'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32p4
@@ -190,7 +196,7 @@ dependencies:
       require: private
       version: '>=4.4'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32s3
@@ -228,7 +234,7 @@ dependencies:
       require: private
       version: '>=5.4'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32p4
@@ -297,52 +303,6 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.1.2
-  espressif/esp_video:
-    component_hash: 5694b16c12b8bb26b56ad3f999ad10119f1314d64b2d1c518bc7dfed902df9e1
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.*
-    - name: espressif/esp_cam_sensor
-      registry_url: https://components.espressif.com
-      require: private
-      version: 2.6.*
-    - matches:
-      - if: $CONFIG{ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION} == False
-      name: espressif/esp_h264
-      registry_url: https://components.espressif.com
-      require: private
-      rules:
-      - if: target in [esp32p4]
-      version: 1.4.*
-    - name: espressif/esp_ipa
-      registry_url: https://components.espressif.com
-      require: private
-      rules:
-      - if: target in [esp32p4]
-      version: 2.4.*
-    - name: idf
-      require: private
-      version: '>=5.4'
-    - name: espressif/usb_host_uvc
-      registry_url: https://components.espressif.com
-      require: private
-      rules:
-      - if: target in [esp32p4, esp32s3, esp32s31]
-      version: 2.5.*
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32p4
-    - esp32s3
-    - esp32c3
-    - esp32c5
-    - esp32c6
-    - esp32c61
-    - esp32s31
-    version: 2.5.0
   espressif/esp_video_codec:
     component_hash: e717c04f9dc491a3fefd655500d7009a107391127e6903c4005bfec0bbd3c29c
     dependencies:
@@ -471,7 +431,7 @@ dependencies:
       - if: target not in ["linux"]
       version: ^1.0.0
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32s2
@@ -582,9 +542,12 @@ direct_dependencies:
 - espressif/esp-sr
 - espressif/esp_audio_codec
 - espressif/esp_audio_effects
+- espressif/esp_cam_sensor
 - espressif/esp_capture
 - espressif/esp_codec_dev
+- espressif/esp_h264
 - espressif/esp_hosted
+- espressif/esp_ipa
 - espressif/esp_muxer
 - espressif/esp_video
 - espressif/esp_video_codec
@@ -592,10 +555,11 @@ direct_dependencies:
 - espressif/esp_wifi_remote
 - espressif/gmf_audio
 - espressif/gmf_video
+- espressif/usb_host_uvc
 - idf
 - livekit/livekit
 - tempotian/av_render
 - tempotian/media_lib_sal
-manifest_hash: 07980f48bb5d4ec5616ffd933b2ac5317485ca77c60d7ae058e98de8cc3d5c2a
+manifest_hash: 2b1ede4826d48e37543efa16e261c84902960a4a307c03936661fc909becca10
 target: esp32p4
 version: 3.0.0

@@ -19,7 +19,8 @@ let snapshot = {
     state: 3, paired: false, connected: true,
     serverUrl: 'https://example.com', tenantId: '',
     deviceUid: 'p4c5-001122334455', deviceId: '', pairingId: 'pending-a',
-    message: '等待配对码',
+    pairingCode: '012345',
+    message: '已连接后台，请在设备页面查看授权码并在后台或小程序输入',
 };
 let failNext = false;
 const context = vm.createContext({
@@ -41,9 +42,9 @@ const context = vm.createContext({
 });
 vm.runInContext(script, context);
 await vm.runInContext('refresh()', context);
-assert.equal(elements.get('pairButton').disabled, false);
 assert.equal(elements.get('uid').textContent, snapshot.deviceUid);
 assert.equal(elements.get('serverUrl').value, 'https://example.com');
+assert.equal(elements.get('pairingCode').textContent, snapshot.pairingCode);
 
 elements.get('serverUrl').value = ' https://new.example.com/ ';
 elements.get('tenantId').value = ' tenant-a ';
@@ -55,24 +56,10 @@ assert.deepEqual(JSON.parse(last.options.body), { serverUrl: 'https://new.exampl
 assert.equal(last.options.headers['Content-Type'], 'application/json');
 assert.equal(last.options.headers['X-Cloud-Control'], '1');
 
-const beforeInvalidCode = requests.length;
-elements.get('pairCode').value = '12x456';
-vm.runInContext('submitCode()', context);
-assert.equal(requests.length, beforeInvalidCode);
-assert.match(elements.get('cloudMessage').textContent, /6 位数字/);
-elements.get('pairCode').value = '012345';
-vm.runInContext('submitCode()', context);
-await new Promise(resolve => setImmediate(resolve));
-last = requests.at(-1);
-assert.equal(last.path, '/api/cloud/pair');
-assert.deepEqual(JSON.parse(last.options.body), { code: '012345' });
-assert.equal(elements.get('pairCode').value, '');
-
-snapshot = { ...snapshot, state: 6, paired: true, deviceId: 'device-a', pairingId: '' };
+snapshot = { ...snapshot, state: 6, paired: true, deviceId: 'device-a', pairingId: '', pairingCode: '' };
 await vm.runInContext('refresh()', context);
 assert.equal(elements.get('serverUrl').disabled, true);
 assert.equal(elements.get('tenantId').disabled, true);
-assert.equal(elements.get('pairButton').disabled, true);
 assert.equal(elements.get('did').textContent, 'device-a');
 
 vm.runInContext('forgetCloud()', context);
@@ -86,5 +73,5 @@ assert.equal(elements.get('cloudMessage').textContent, '设备忙');
 assert.equal(elements.get('connectButton').disabled, false);
 assert.equal(elements.get('forgetButton').disabled, false);
 
-export const results = 'PASS: embedded script syntax, status rendering, server configuration, pairing code validation/submission, paired controls, local forget, HTTP error recovery';
+export const results = 'PASS: embedded script syntax, status rendering, pairing-code display, server configuration, paired controls, local forget, HTTP error recovery';
 console.log(results);

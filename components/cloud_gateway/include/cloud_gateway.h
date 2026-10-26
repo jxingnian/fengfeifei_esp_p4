@@ -18,6 +18,7 @@ typedef enum {
     CLOUD_GATEWAY_SYNC_TIME,
     CLOUD_GATEWAY_CONNECTING,
     CLOUD_GATEWAY_WAIT_CODE,
+    /* 保留旧状态编号，避免本地状态页面和外部监控的数值协议发生变化。 */
     CLOUD_GATEWAY_PAIRING,
     CLOUD_GATEWAY_AUTHORIZED,
     CLOUD_GATEWAY_READY,
@@ -25,7 +26,7 @@ typedef enum {
     CLOUD_GATEWAY_ERROR,
 } cloud_gateway_state_t;
 
-/* Safe to expose locally. Never contains authorization codes. */
+/* 仅供本地配网页面使用；pairing_code 是一次性临时授权码，长期授权码不在状态结构中。 */
 typedef struct {
     cloud_gateway_state_t state;
     bool paired;
@@ -35,6 +36,8 @@ typedef struct {
     char device_uid[40];
     char device_id[65];
     char pairing_id[65];
+    /* 临时授权码仅用于设备本地显示，长期授权码不会进入状态结构。 */
+    char pairing_code[7];
     char message[192];
     uint32_t retry_seconds;
 } cloud_gateway_status_t;
@@ -59,7 +62,6 @@ esp_err_t cloud_gateway_get_status(cloud_gateway_status_t *status);
 /* Asynchronous commands; ESP_OK means queued, inspect status for final result.
  * Changing server/tenant while paired is rejected: explicitly forget first. */
 esp_err_t cloud_gateway_configure(const char *server_url, const char *tenant_id);
-esp_err_t cloud_gateway_pair(const char *six_digit_code);
 /* Clears local credentials only; does not revoke the backend record. */
 esp_err_t cloud_gateway_forget(void);
 /* Bounded, nonblocking enqueue, available only after ready. Never exposes auth. */

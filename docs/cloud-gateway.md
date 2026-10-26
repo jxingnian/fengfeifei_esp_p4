@@ -4,9 +4,9 @@
 
 1. 手机连接设备热点，在 `http://192.168.4.1` 配置 Wi-Fi。
 2. 同一页面的“后台连接与设备配对”区域填写 HTTPS 后台源地址（默认 `https://iot.xingnian.vip`，不带接口路径）。客户 ID 选填：填写后台组织 ID 后该客户管理员可查看；留空时只有平台管理员能看到待配对设备。
-3. 点击“连接后台 / 重新连接”，等待“等待配对码”。在后台设备管理按设备 UID 查找待配对设备，选择客户并生成 6 位配对码。
-4. 在设备页面输入配对码。后台返回设备 ID 和长期授权码，设备将两者与服务器地址一起提交到 NVS，再建立正式连接。显示“后台就绪”表示收到正式连接的 `ready`。
-5. 重启后自动使用保存的授权连接。配对码有效期 5 分钟、单次使用，连续错误最多 5 次；临时连接最多 10 分钟。临时连接断开后待配对 ID 改变，必须重新生成配对码。
+3. 点击“连接后台 / 重新连接”，设备会自动获得 6 位授权码，并在本地状态页面显示。后台设备管理按设备 UID 查找待配对设备，管理员或小程序用户输入该授权码。
+4. 后台选择客户，可选指定后台用户；小程序自动绑定当前小程序用户。服务端返回长期授权码，设备将其与设备 ID、服务器地址一起提交到 NVS，再建立正式连接。
+5. 重启后自动使用保存的授权连接。授权码有效期 5 分钟且成功后立即失效；临时连接最多 10 分钟，断开后需重新连接并使用新授权码。
 
 `/cloud` 也可单独打开。默认仅允许 HTTPS，证书链和域名通过 ESP-IDF 证书包校验；联网后通过 NTP 同步系统时间。局域网调试可在 menuconfig 开启 `CLOUD_GATEWAY_ALLOW_INSECURE` 后使用 HTTP（授权将明文传输）。已有 sdkconfig 的工程应确认 `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y`。
 
@@ -20,26 +20,25 @@
 
 ## 本地 API
 
-GET `/api/cloud/status` 返回 state、paired、connected、serverUrl、tenantId、deviceUid、deviceId、pairingId、message、retrySeconds，不含授权码。connected 仅代表 WebSocket 已打开；state=6 才代表正式连接 ready。
+GET `/api/cloud/status` 返回 state、paired、connected、serverUrl、tenantId、deviceUid、deviceId、pairingId、pairingCode、message、retrySeconds。`pairingCode` 仅在设备本地页面返回；长期授权码不返回。connected 仅代表 WebSocket 已打开；state=6 才代表正式连接 ready。
 
 POST 请求必须同时带 `Content-Type: application/json`、`X-Cloud-Control: 1`。不开放跨域访问。202 仅表示命令入队，最终结果通过状态接口查询。
 
 | 接口 | JSON 请求 |
 | --- | --- |
 | `/api/cloud/configure` | `{"serverUrl":"https://iot.xingnian.vip","tenantId":"组织ID或空字符串"}` |
-| `/api/cloud/pair` | `{"code":"628391"}` |
 | `/api/cloud/forget` | `{}` |
 
 配对后禁止直接更改服务器或客户，需先解除本地授权；相同配置可用于重新连接。解除本地授权不撤销后台权限，管理员还应撤销旧设备记录。管理接口沿用现有配网的局域网信任边界，没有独立登录；仅供可信热点/局域网使用，不能映射到公网。
 
 ## 后台协议与异常恢复
 
-临时连接为 `/ws/device/pair`：设备发送 hello（稳定 eFuse MAC 派生 UID、固件版本、麦克风/扬声器能力、可选 tenantId），收到 pairing_pending 后提交 pair/code。收到 paired/deviceId/deviceAuthCode 后持久化，再连接 `/ws/device`，使用 `X-Device-Id` 与 `Authorization: Bearer <deviceAuthCode>` 请求头。
+临时连接为 `/ws/device/pair`：设备发送 hello（稳定 eFuse MAC 派生 UID、固件版本、麦克风/扬声器能力、可选 tenantId），收到包含 `code` 的 `pairing_pending` 后显示授权码。后台或小程序提交授权码，服务端在同一连接返回 `paired/deviceId/deviceAuthCode`；设备持久化后再连接 `/ws/device`。
 
 - 普通断线采用带抖动的指数退避，最长约 60 秒；Wi-Fi 断开时等待联网。
 - AUTH_REVOKED 清除已保存授权并重新进入配对；持久化失败则停止重连，等待人工清除。
 - AUTH_FAILED 保留授权并停止重连；修复后台客户/设备状态后点击重新连接。
-- 配对码错误、过期、锁定在页面显示后台提示；按提示在后台重新生成码。
+- 授权码过期或临时连接断开后，重新连接设备并使用新显示的授权码。
 - 授权保存失败时停止重连，避免未保存的身份被当成已成功配对。需管理员撤销本次后台记录，再重新配对。
 - 等待同步时间时检查 NTP/DNS；TLS 或网络握手失败时检查服务器证书、端口和网络。
 
@@ -51,4 +50,4 @@ POST 请求必须同时带 `Content-Type: application/json`、`X-Cloud-Control: 
 
 ## 验证清单
 
-在具备 ESP-IDF 6.x 和 ESP32-P4 工具链的机器运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build\build.ps1`（可通过 IDF_PATH、IDF_TOOLS_PATH 指定安装位置），首次构建解析 esp_websocket_client 组件依赖。构建成功后上板验证：首次配对、错误/过期配对码、重启免配对、Wi-Fi 断线恢复、后台重启、AUTH_FAILED 保留授权、后台撤销后重新配对、更换服务器前清除本地授权。
+在具备 ESP-IDF 6.x 和 ESP32-P4 工具链的机器运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build\build.ps1`（可通过 IDF_PATH、IDF_TOOLS_PATH 指定安装位置），首次构建解析 esp_websocket_client 组件依赖。构建成功后上板验证：首次配对、授权码过期、重启免配对、Wi-Fi 断线恢复、后台重启、AUTH_FAILED 保留授权、后台撤销后重新配对、更换服务器前清除本地授权。

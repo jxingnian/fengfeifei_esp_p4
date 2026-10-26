@@ -17,31 +17,27 @@ static const char s_cloud_html[] =
     "<div class='box'><h2>后台连接与设备配对</h2><div class='grid'>"
     "<span>设备 UID</span><b id='uid'>-</b><span>连接状态</span><b id='cloudState'>读取中</b>"
     "<span>配对状态</span><b id='paired'>-</b><span>设备 ID</span><b id='did'>-</b>"
-    "<span>待配对 ID</span><b id='pid'>-</b></div>"
+    "<span>待配对 ID</span><b id='pid'>-</b><span>设备授权码</span><b id='pairingCode'>-</b></div>"
     "<label>服务器地址<input id='serverUrl' maxlength='191' placeholder='https://iot.xingnian.vip'></label>"
     "<label>客户 ID（选填）<input id='tenantId' maxlength='64' placeholder='后台组织 ID；不填时由平台管理员配对'></label>"
     "<button id='connectButton' onclick='configureCloud()'>连接后台 / 重新连接</button>"
-    "<label>配对码<input id='pairCode' inputmode='numeric' pattern='[0-9]{6}' maxlength='6' autocomplete='off' placeholder='后台生成的 6 位配对码'></label>"
-    "<button id='pairButton' onclick='submitCode()' disabled>提交配对码并授权</button>"
     "<button id='forgetButton' class='danger' onclick='forgetCloud()'>解除本地授权</button>"
     "<div id='cloudMessage' class='msg' role='status'></div><div class='muted'>"
-    "先连接 Wi-Fi，再连接后台。管理员根据设备 UID 在后台生成配对码，将配对码输入此处完成授权。"
-    "重连导致待配对 ID 改变后，请重新生成配对码。授权码仅保存在设备中。</div></div>"
+    "先连接 Wi-Fi，再连接后台。设备会自动生成授权码并显示在此处，请在后台或小程序输入该授权码完成配对。"
+    "授权成功后设备会自动保存长期凭证并连接正式服务。</div></div>"
     "<script>const el=id=>document.getElementById(id);let initialized=false,busy=false;"
     "const states=['等待 Wi-Fi','同步时间','连接中','等待配对码','验证配对码','已授权','后台就绪','重连等待','错误'];"
     "async function request(path,data){const options=data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-Cloud-Control':'1'},body:JSON.stringify(data)};"
     "const r=await fetch(path,options),j=await r.json();if(!r.ok)throw Error(j.message||'请求失败');return j;}"
     "async function refresh(){try{const s=await request('/api/cloud/status');el('uid').textContent=s.deviceUid;el('cloudState').textContent=states[s.state]||'未知';"
-    "el('paired').textContent=s.paired?'已配对':'未配对';el('did').textContent=s.deviceId||'-';el('pid').textContent=s.pairingId||'-';"
-    "el('serverUrl').disabled=s.paired||busy;el('tenantId').disabled=s.paired||busy;el('pairButton').disabled=busy||s.state!==3;"
+    "el('paired').textContent=s.paired?'已配对':'未配对';el('did').textContent=s.deviceId||'-';el('pid').textContent=s.pairingId||'-';el('pairingCode').textContent=s.pairingCode||'-';"
+    "el('serverUrl').disabled=s.paired||busy;el('tenantId').disabled=s.paired||busy;"
     "if(!initialized){el('serverUrl').value=s.serverUrl;el('tenantId').value=s.tenantId;initialized=true;}"
     "if(!busy)el('cloudMessage').textContent=s.message;}catch(e){el('cloudMessage').textContent=e.message;}}"
-    "async function command(path,data){if(busy)return;busy=true;el('connectButton').disabled=true;el('forgetButton').disabled=true;el('pairButton').disabled=true;"
+    "async function command(path,data){if(busy)return;busy=true;el('connectButton').disabled=true;el('forgetButton').disabled=true;"
     "try{await request(path,data);el('cloudMessage').textContent='请求已提交，等待设备处理';}catch(e){el('cloudMessage').textContent=e.message;}"
     "finally{busy=false;el('connectButton').disabled=false;el('forgetButton').disabled=false;}}"
     "function configureCloud(){command('/api/cloud/configure',{serverUrl:el('serverUrl').value.trim().replace(/\\/+$/,''),tenantId:el('tenantId').value.trim()});}"
-    "function submitCode(){const code=el('pairCode').value.trim();if(!/^[0-9]{6}$/.test(code)){el('cloudMessage').textContent='请输入 6 位数字配对码';return;}"
-    "command('/api/cloud/pair',{code});el('pairCode').value='';}"
     "function forgetCloud(){if(confirm('确认清除本机授权？后台记录和权限还需管理员撤销。'))command('/api/cloud/forget',{});}"
     "async function poll(){await refresh();setTimeout(poll,2000);}poll();</script></html>";
 
@@ -118,6 +114,8 @@ static esp_err_t status_handler(httpd_req_t *request)
     cJSON_AddStringToObject(root, "deviceUid", s.device_uid);
     cJSON_AddStringToObject(root, "deviceId", s.device_id);
     cJSON_AddStringToObject(root, "pairingId", s.pairing_id);
+    /* 临时授权码只返回给设备本地页面，长期设备授权码不会出现在这里。 */
+    cJSON_AddStringToObject(root, "pairingCode", s.pairing_code);
     cJSON_AddStringToObject(root, "message", s.message);
     cJSON_AddNumberToObject(root, "retrySeconds", s.retry_seconds);
     return send_json(request, "200 OK", root);
@@ -131,8 +129,6 @@ static esp_err_t command_handler(httpd_req_t *request)
     if (!strcmp(request->uri, "/api/cloud/configure")) {
         const char *tenant = field(root, "tenantId");
         error = cloud_gateway_configure(field(root, "serverUrl"), tenant ? tenant : "");
-    } else if (!strcmp(request->uri, "/api/cloud/pair")) {
-        error = cloud_gateway_pair(field(root, "code"));
     } else error = cloud_gateway_forget();
     cJSON_Delete(root);
     return result(request, error);
@@ -142,7 +138,6 @@ static const httpd_uri_t s_handlers[] = {
     {.uri = "/cloud", .method = HTTP_GET, .handler = index_handler},
     {.uri = "/api/cloud/status", .method = HTTP_GET, .handler = status_handler},
     {.uri = "/api/cloud/configure", .method = HTTP_POST, .handler = command_handler},
-    {.uri = "/api/cloud/pair", .method = HTTP_POST, .handler = command_handler},
     {.uri = "/api/cloud/forget", .method = HTTP_POST, .handler = command_handler},
 };
 

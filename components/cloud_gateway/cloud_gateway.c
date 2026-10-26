@@ -22,7 +22,7 @@
 
 /* Only worker owns client/storage. Callback copies bounded messages to queue.
  * Epochs prevent queued traffic from an old connection reaching a new session. */
-typedef enum { CMD_CONFIG, CMD_PAIR, CMD_FORGET, CMD_SEND, EV_OPEN, EV_CLOSE, EV_DATA } item_type_t;
+typedef enum { CMD_CONFIG, CMD_FORGET, CMD_SEND, EV_OPEN, EV_CLOSE, EV_DATA } item_type_t;
 typedef struct {
     item_type_t type;
     unsigned epoch;
@@ -152,16 +152,6 @@ esp_err_t cloud_gateway_configure(const char *url, const char *tenant)
     return enqueue(CMD_CONFIG, false, &value, sizeof(value));
 }
 
-esp_err_t cloud_gateway_pair(const char *code)
-{
-    if (!code || strlen(code) != 6) return ESP_ERR_INVALID_ARG;
-    for (int i = 0; i < 6; ++i) if (code[i] < '0' || code[i] > '9') return ESP_ERR_INVALID_ARG;
-    cloud_gateway_status_t status;
-    if (cloud_gateway_get_status(&status) != ESP_OK || status.state != CLOUD_GATEWAY_WAIT_CODE)
-        return ESP_ERR_INVALID_STATE;
-    return enqueue(CMD_PAIR, false, code, 7);
-}
-
 esp_err_t cloud_gateway_forget(void) { return enqueue(CMD_FORGET, false, NULL, 0); }
 
 esp_err_t cloud_gateway_send(bool binary, const void *data, size_t length)
@@ -228,6 +218,7 @@ static void disconnect_client(void)
     s_rx = NULL;
     s_rx_length = 0;
     s_status.pairing_id[0] = 0;
+    s_status.pairing_code[0] = 0;
     atomic_store(&s_overflow, false);
     s_deadline = 0;
 }
@@ -278,10 +269,11 @@ static void receive_message(const item_t *item)
         const char *type = string_field(root, "type");
         if (!s_credentials.auth_code[0] && !strcmp(type, "pairing_pending")) {
             strlcpy(s_status.pairing_id, string_field(root, "pairingId"), sizeof(s_status.pairing_id));
+            strlcpy(s_status.pairing_code, string_field(root, "code"), sizeof(s_status.pairing_code));
             s_deadline = 0;
             s_backoff = 1;
-            publish(CLOUD_GATEWAY_WAIT_CODE, "已连接，请在后台生成配对码后输入");
-        } else if (!s_credentials.auth_code[0] && s_status.state == CLOUD_GATEWAY_PAIRING &&
+            publish(CLOUD_GATEWAY_WAIT_CODE, "已连接后台，请在设备页面查看授权码并在后台或小程序输入");
+        } else if (!s_credentials.auth_code[0] &&
                    !strcmp(type, "paired")) {
             const char *id = string_field(root, "deviceId"), *auth = string_field(root, "deviceAuthCode");
             if (credential_field(id, sizeof(s_credentials.device_id)) &&
@@ -372,14 +364,7 @@ static void process_item(item_t *item)
         if (!s_credentials.auth_code[0]) send_hello();
     } else if (item->type == EV_CLOSE) s_restart = true;
     else if (item->type == EV_DATA) receive_message(item);
-    else if (item->type == CMD_PAIR && s_status.state == CLOUD_GATEWAY_WAIT_CODE) {
-        char json[40];
-        snprintf(json, sizeof(json), "{\"type\":\"pair\",\"code\":\"%s\"}", (char *)item->data);
-        if (send_text(json)) {
-            s_deadline = now_ms() + 15000;
-            publish(CLOUD_GATEWAY_PAIRING, "正在验证配对码");
-        } else s_restart = true;
-    } else if (item->type == CMD_SEND && s_status.state == CLOUD_GATEWAY_READY) {
+    else if (item->type == CMD_SEND && s_status.state == CLOUD_GATEWAY_READY) {
         int sent = item->binary
             ? esp_websocket_client_send_bin(s_client, item->data, item->length, pdMS_TO_TICKS(2000))
             : esp_websocket_client_send_text(s_client, item->data, item->length, pdMS_TO_TICKS(2000));
@@ -437,7 +422,7 @@ static void worker(void *arg)
             s_backoff = s_immediate ? 1 : s_backoff < 30 ? s_backoff * 2 : 60;
             s_immediate = false;
             publish(s_halted ? CLOUD_GATEWAY_ERROR : CLOUD_GATEWAY_RETRY,
-                    s_halted ? NULL : "连接已断开，将自动重连；待配对连接变化后请重新生成配对码");
+                    s_halted ? NULL : "连接已断开，将自动重连；重新连接后请使用设备显示的新授权码");
         }
         if (s_halted) continue;
         if (!network) { publish(CLOUD_GATEWAY_WAIT_NETWORK, "请先连接 Wi-Fi"); continue; }

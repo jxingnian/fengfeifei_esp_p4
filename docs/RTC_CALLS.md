@@ -62,7 +62,7 @@ idf.py -B build/esp-idf-output -p COM7 flash monitor
 组件管理器会更新 `dependencies.lock`，应在真正 reconfigure 后审查锁文件，不手填依赖哈希。
 先确认新固件及唤醒模型仍适合现有分区；不需擦除整个 Flash 或配对 NVS。
 
-设备配网和配对继续沿用原网页：保存后台 HTTPS 地址、生成并输入配对码。
+设备配网和配对继续沿用原网页：保存后台 HTTPS 地址，设备自动显示授权码，再由后台或小程序输入授权码。
 P4 中不存 LiveKit API secret，通话期间临时令牌由已鉴权业务连接下发。
 HTTPS/WSS 需要时间同步与正确证书；沿用网关现有 SNTP，不关闭证书校验。
 
