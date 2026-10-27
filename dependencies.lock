@@ -1,4 +1,10 @@
 dependencies:
+  esp_coze:
+    dependencies: []
+    source:
+      path: components/esp_coze
+      type: local
+    version: 1.0.0
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:
@@ -6,7 +12,7 @@ dependencies:
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.7.19~2
   espressif/dl_fft:
@@ -109,32 +115,6 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.5.11
-  espressif/esp_coze:
-    component_hash: e448e7fe42fbe8757425a14d1524fe2ee23f0ad91bea302dfdaa0edd37fd8da0
-    dependencies:
-    - name: espressif/cjson
-      registry_url: https://components.espressif.com
-      require: private
-      rules:
-      - if: idf_version >=6.0
-      version: ^1.7.19
-    - name: espressif/esp_websocket_client
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=1.7.0'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32
-    - esp32s3
-    - esp32s2
-    - esp32p4
-    - esp32c3
-    - esp32c6
-    - esp32c5
-    - esp32s31
-    version: 1.0.0
   espressif/esp_hosted:
     component_hash: 9eea9ce83444a412b4a02311f787f3639a5d29fe67e6df83863010dd68ab250b
     dependencies:
@@ -181,7 +161,7 @@ dependencies:
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.8.0
   espressif/esp_wifi_remote:
@@ -223,13 +203,15 @@ dependencies:
       type: idf
     version: 6.1.0
 direct_dependencies:
+- espressif/cjson
 - espressif/esp-sr
 - espressif/esp_audio_codec
 - espressif/esp_codec_dev
 - espressif/esp_coze
 - espressif/esp_hosted
+- espressif/esp_websocket_client
 - espressif/esp_wifi_remote
 - idf
-manifest_hash: d40b3dcdd7121d25c2edddd74e593eb3be0702f0f51d5037723ec81dee5599d0
+manifest_hash: 6153a8af0e9b08f3dd5a02b80ab2cae9de7c1f4bab74201f0124406268abe316
 target: esp32p4
 version: 3.0.0
