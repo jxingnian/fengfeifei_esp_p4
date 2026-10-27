@@ -1,4 +1,4 @@
-﻿menu "Coze 直连 AI 应用"
+menu "Coze 直连 AI 应用"
 
     config COZE_APP_BOT_ID
         string "Coze Bot ID"

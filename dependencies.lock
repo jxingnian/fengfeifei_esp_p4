@@ -1,4 +1,4 @@
-﻿dependencies:
+dependencies:
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:
@@ -33,8 +33,64 @@
       registry_url: https://components.espressif.com
       type: service
     version: 1.1.6
+  espressif/esp-dl:
+    component_hash: 3608ac32875cb7fa93805fba2372619bde3d8a02cee47c622cf5e91a1308fe92
+    dependencies:
+    - name: espressif/dl_fft
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.8.0'
+    - name: espressif/esp_new_jpeg
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1
+    - name: idf
+      require: private
+      version: '*'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    targets:
+    - esp32
+    - esp32c2
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32p4
+    - esp32s2
+    - esp32s3
+    - esp32s31
+    version: 3.3.14
+  espressif/esp-sr:
+    component_hash: f828073fa761cfa88c6d97e2c664d233b29c6d8b77e1a35b2fbe306fc5dc1108
+    dependencies:
+    - name: espressif/cjson
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.7.19
+    - name: espressif/dl_fft
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.6.0'
+    - name: espressif/esp-dl
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~3.3.12
+    - name: espressif/esp-dsp
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target in [esp32, esp32s2, esp32c3, esp32c5, esp32c6]
+      version: 1.8.0
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.6.0
   espressif/esp_audio_codec:
-    component_hash: 04c2f0d5eca207cdfabd3aafc50ef4bca53532115ddf7689e5cfabd00eb88b02
+    component_hash: a5b9275af74247e3ce536d16a7080e4d77207a185b63e1bea368eb4d57176c2b
     dependencies:
     - name: idf
       require: private
@@ -42,7 +98,7 @@
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 2.3.0
+    version: 2.6.2
   espressif/esp_codec_dev:
     component_hash: df70f10af8d7b922add7b9d07372c9c97ab356e58d72b7a892050227c2d44348
     dependencies:
@@ -125,7 +181,7 @@
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
     version: 1.8.0
   espressif/esp_wifi_remote:
@@ -148,62 +204,6 @@
       registry_url: https://components.espressif.com/
       type: service
     version: 1.6.5
-  espressif/esp-dl:
-    component_hash: 3608ac32875cb7fa93805fba2372619bde3d8a02cee47c622cf5e91a1308fe92
-    dependencies:
-    - name: espressif/dl_fft
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.8.0'
-    - name: espressif/esp_new_jpeg
-      registry_url: https://components.espressif.com
-      require: private
-      version: ^1
-    - name: idf
-      require: private
-      version: '*'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    targets:
-    - esp32
-    - esp32c2
-    - esp32c3
-    - esp32c5
-    - esp32c6
-    - esp32p4
-    - esp32s2
-    - esp32s3
-    - esp32s31
-    version: 3.3.14
-  espressif/esp-sr:
-    component_hash: f828073fa761cfa88c6d97e2c664d233b29c6d8b77e1a35b2fbe306fc5dc1108
-    dependencies:
-    - name: espressif/cjson
-      registry_url: https://components.espressif.com
-      require: private
-      version: ^1.7.19
-    - name: espressif/dl_fft
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.6.0'
-    - name: espressif/esp-dl
-      registry_url: https://components.espressif.com
-      require: private
-      version: ~3.3.12
-    - name: espressif/esp-dsp
-      registry_url: https://components.espressif.com
-      require: private
-      rules:
-      - if: target in [esp32, esp32s2, esp32c3, esp32c5, esp32c6]
-      version: 1.8.0
-    - name: idf
-      require: private
-      version: '>=5.0'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 2.6.0
   espressif/wifi_remote_over_eppp:
     component_hash: 1fd6968af20f0b19e421f6b519b0a8caf81d689afc3783b564c28559e45f66ef
     dependencies:
@@ -224,10 +224,12 @@
     version: 6.1.0
 direct_dependencies:
 - espressif/esp-sr
+- espressif/esp_audio_codec
 - espressif/esp_codec_dev
 - espressif/esp_coze
 - espressif/esp_hosted
 - espressif/esp_wifi_remote
 - idf
+manifest_hash: d40b3dcdd7121d25c2edddd74e593eb3be0702f0f51d5037723ec81dee5599d0
 target: esp32p4
 version: 3.0.0
