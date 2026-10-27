@@ -423,6 +423,14 @@ esp_err_t wake_word_stop(void)
 
 void wake_word_start_conversation(void)
 {
+    /*
+     * 播放打断功能要求采集任务在整个 AI 会话期间持续运行。
+     * 同一轮会话可能多次调用本函数，因此已经处于对话模式时必须保持幂等，
+     * 不能再次尝试把已经属于 AI_DIALOG 的音频所有权转移一次。
+     */
+    if (s_conversation_active) {
+        return;
+    }
     s_conversation_active = true;
     (void)audio_service_transfer(
         AUDIO_SERVICE_OWNER_WAKE_WORD,

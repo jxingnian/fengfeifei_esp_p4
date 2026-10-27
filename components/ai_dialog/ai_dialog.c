@@ -43,6 +43,14 @@
 #define OPUS_RING_BUFFER_BYTES (200U * 1024U)
 #define OPUS_RING_DESCRIPTOR_COUNT 4096U
 
+/*
+ * 播放打断检测使用 60 ms 的采集帧。连续两帧被本地 VAD 判定为语音后才
+ * 触发打断，既能把响应延迟控制在约 120 ms，也能过滤单帧噪声和按键声。
+ */
+#define INTERRUPT_MIN_SPEECH_FRAMES 2U
+/* 播放期间保留 300 ms 前置语音，避免 VAD 判定完成前丢掉用户开头。 */
+#define INTERRUPT_PRE_ROLL_FRAMES PRE_ROLL_FRAMES
+
 typedef struct { unsigned generation; int16_t samples[FRAME_SAMPLES]; } capture_t;
 typedef struct { size_t length; uint8_t *data; unsigned turn, seq; } packet_t;
 typedef struct { size_t length; uint8_t *data; unsigned generation, turn, seq; } pcm_t;
@@ -57,6 +65,7 @@ static QueueHandle_t s_control_queue, s_encode_queue, s_pcm_queue;
 static SemaphoreHandle_t s_control_mutex, s_encoder_mutex, s_pcm_mutex, s_output_mutex, s_capture_mutex;
 static SemaphoreHandle_t s_opus_mutex, s_opus_data_sem;
 static atomic_bool s_initialized, s_ready, s_wake_requested, s_restore_pending, s_speech_started;
+static atomic_bool s_interrupt_requested;
 static atomic_uint s_generation, s_turn, s_failure;
 static atomic_uint s_produced_samples, s_encoded, s_decoded, s_written, s_tx_bytes;
 static atomic_uint s_capture_drops, s_encode_drops, s_rx_drops, s_decode_drops, s_write_drops;
@@ -67,9 +76,15 @@ static unsigned s_end_sequence;
 static bool s_wait_warning, s_input_opus, s_server_vad;
 static capture_t s_capture_frame;
 static size_t s_captured;
+/* 这些数据只由麦克风采集回调在 s_capture_mutex 保护下读写。 */
+static capture_t s_interrupt_pre_roll[INTERRUPT_PRE_ROLL_FRAMES];
+static unsigned s_interrupt_pre_roll_count;
+static unsigned s_interrupt_speech_frames;
 static void *s_encoder;
 static void *s_decoder;
 static vad_handle_t s_vad;
+/* 播放打断检测独占一个 VAD 实例，避免与上行编码任务并发访问同一实例。 */
+static vad_handle_t s_interrupt_vad;
 static _Alignas(16) uint8_t s_encoded_buffer[MAX_PACKET];
 static capture_t s_pre_roll[PRE_ROLL_FRAMES]; /* encoder owns ring */
 static uint8_t *s_opus_ring;
@@ -340,6 +355,83 @@ static void reset_capture(void)
     xQueueReset(s_encode_queue);
     xSemaphoreGive(s_capture_mutex);
 }
+
+/**
+ * @brief 清零播放期间的本地打断检测器。
+ *
+ * 该函数只清除检测计数，不清除前置 PCM；前置 PCM 会在真正开始新 turn
+ * 时重新送入编码队列，保证用户第一句话的开头不会丢失。
+ */
+static void reset_interrupt_detector(void)
+{
+    s_interrupt_pre_roll_count = 0;
+    s_interrupt_speech_frames = 0;
+    if (s_interrupt_vad != NULL) {
+        vad_reset_trigger(s_interrupt_vad);
+    }
+}
+
+/**
+ * @brief 判断一帧播放期间采集到的 PCM 是否包含稳定人声。
+ *
+ * 麦克风 PCM 在 audio_service 中已经经过 ESP-SR AEC，当前这里只判断
+ * AEC 输出中的连续人声，不再使用上一版没有依据的原始音量门限。
+ */
+static bool interrupt_frame_is_speech(int16_t *samples, size_t count)
+{
+    if (samples == NULL || count < 320U || s_interrupt_vad == NULL) {
+        return false;
+    }
+
+    unsigned speech_count = 0;
+
+    for (size_t offset = 0; offset + 320U <= count; offset += 320U) {
+        if (vad_process(s_interrupt_vad, samples + offset, 16000, 20) == VAD_SPEECH) {
+            speech_count++;
+        }
+    }
+
+    return speech_count >= 2U;
+}
+
+/**
+ * @brief 在播放状态下记录采集帧并请求中断。
+ *
+ * 麦克风回调运行在采集任务中，只允许做固定时间的内存复制和 VAD 计算，
+ * 不在这里调用 Coze、操作队列或关闭扬声器；真正的清理由控制任务完成。
+ */
+static void inspect_playback_capture(int16_t *samples, size_t count)
+{
+    if (samples == NULL || count != FRAME_SAMPLES) {
+        return;
+    }
+
+    if (s_interrupt_pre_roll_count < INTERRUPT_PRE_ROLL_FRAMES) {
+        s_interrupt_pre_roll[s_interrupt_pre_roll_count].generation = atomic_load(&s_generation);
+        memcpy(s_interrupt_pre_roll[s_interrupt_pre_roll_count].samples,
+               samples,
+               sizeof(s_interrupt_pre_roll[0].samples));
+        s_interrupt_pre_roll_count++;
+    } else {
+        memmove(&s_interrupt_pre_roll[0],
+                &s_interrupt_pre_roll[1],
+                sizeof(s_interrupt_pre_roll[0]) * (INTERRUPT_PRE_ROLL_FRAMES - 1U));
+        s_interrupt_pre_roll[INTERRUPT_PRE_ROLL_FRAMES - 1U].generation = atomic_load(&s_generation);
+        memcpy(s_interrupt_pre_roll[INTERRUPT_PRE_ROLL_FRAMES - 1U].samples,
+               samples,
+               sizeof(s_interrupt_pre_roll[0].samples));
+    }
+
+    if (interrupt_frame_is_speech(samples, count)) {
+        s_interrupt_speech_frames++;
+    } else {
+        s_interrupt_speech_frames = 0;
+    }
+
+    if (s_interrupt_speech_frames >= INTERRUPT_MIN_SPEECH_FRAMES) {
+        atomic_store(&s_interrupt_requested, true);
+    }
+}
 static void acknowledge(unsigned turn, unsigned seq)
 {
     coze_app_playback_progress(turn, seq);
@@ -356,6 +448,7 @@ static void finish(const char *reason, bool notify, bool restore)
     bool active = ai_dialog_logic_is_session_active();
     ai_dialog_logic_reset();
     atomic_store(&s_wake_requested, false);
+    atomic_store(&s_interrupt_requested, false);
     if (active && notify) (void)coze_app_cancel(atomic_load(&s_turn));
     reset_capture();
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
@@ -474,8 +567,7 @@ static void process_text(packet_t *packet)
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_TURN_COMMITTED);
 
             /* 提前启用扬声器，避免后续 audio_start 时音频数据竞态导致前几帧丢失 */
-            if (wake_word_stop() != ESP_OK ||
-                audio_service_set_output_enabled(
+            if (audio_service_set_output_enabled(
                     AUDIO_SERVICE_OWNER_AI_DIALOG,
                     true
                 ) != ESP_OK) {
@@ -494,10 +586,15 @@ static void process_text(packet_t *packet)
              (s_server_vad && ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING))) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
 
+            /* 每次新回复开始时重新建立播放期前置缓冲和独立 VAD 的状态。 */
+            xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+            reset_interrupt_detector();
+            s_captured = 0;
+            xSemaphoreGive(s_capture_mutex);
+
             /* server_vad 模式下扬声器已在 speech_stopped 提前启用；非 server_vad 模式在此启用 */
             if (!s_server_vad) {
-                if (wake_word_stop() != ESP_OK ||
-                    audio_service_set_output_enabled(
+                if (audio_service_set_output_enabled(
                         AUDIO_SERVICE_OWNER_AI_DIALOG,
                         true
                     ) != ESP_OK) {
@@ -915,6 +1012,78 @@ static void try_drain(void)
         else atomic_store(&s_failure, 3);
     }
 }
+
+/**
+ * @brief 把播放打断前保存的 300 ms 语音前置帧送入新一轮编码队列。
+ *
+ * 该函数必须在 begin_turn() 之后调用，因为 begin_turn() 会递增 generation
+ * 并清空旧的上行队列；重新写入新的 generation 后，旧回复数据不会混入新轮次。
+ */
+static void enqueue_interrupt_pre_roll(void)
+{
+    xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+    const unsigned generation = atomic_load(&s_generation);
+    for (unsigned i = 0; i < s_interrupt_pre_roll_count; ++i) {
+        capture_t frame = s_interrupt_pre_roll[i];
+        frame.generation = generation;
+        if (xQueueSend(s_encode_queue, &frame, 0) != pdTRUE) {
+            atomic_fetch_add(&s_capture_drops, 1);
+        }
+    }
+    reset_interrupt_detector();
+    xSemaphoreGive(s_capture_mutex);
+}
+
+/**
+ * @brief 中断当前 AI 回复，但不关闭 Coze WebSocket。
+ *
+ * 播放打断和异常结束是两条不同的生命周期：异常结束可以关闭会话，
+ * 播放打断必须保留长连接，并把用户已经说出的前置语音送入下一轮 turn。
+ */
+static void interrupt_playback(void)
+{
+    if (!playing() || !ai_dialog_logic_is_session_active()) {
+        return;
+    }
+
+    const unsigned old_turn = atomic_load(&s_turn);
+    ESP_LOGI(TAG, "turn=%u 检测到播放期间用户说话，开始打断", old_turn);
+
+    /* 先让采集回调停止继续积累播放期数据，再清理所有旧回复缓存。 */
+    ai_dialog_logic_reset();
+    reset_capture();
+    xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_pcm_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_output_mutex, portMAX_DELAY);
+    opus_ring_clear();
+    clear_pcm();
+    (void)audio_service_set_output_enabled(
+        AUDIO_SERVICE_OWNER_AI_DIALOG,
+        false
+    );
+    atomic_store(&s_end_seen, false);
+    xSemaphoreGive(s_output_mutex);
+    xSemaphoreGive(s_pcm_mutex);
+    xSemaphoreGive(s_encoder_mutex);
+
+    /* Coze SDK 的该接口发送 conversation.chat.cancel，只取消当前回答。 */
+    esp_err_t cancel_error = coze_app_cancel(old_turn);
+    if (cancel_error != ESP_OK) {
+        ESP_LOGE(TAG, "turn=%u 播放打断取消后端回复失败：%s", old_turn, esp_err_to_name(cancel_error));
+        atomic_store(&s_failure, 1);
+        return;
+    }
+
+    /* 恢复逻辑状态后立即开始新 turn，旧网络事件会被 turn/generation 丢弃。 */
+    (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_WAKE_DETECTED);
+    (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_BACKEND_READY);
+    if (!begin_turn()) {
+        atomic_store(&s_failure, 1);
+        return;
+    }
+    enqueue_interrupt_pre_roll();
+    ESP_LOGI(TAG, "turn=%u 播放已停止，已进入新的用户语音输入轮次", atomic_load(&s_turn));
+}
 static void ai_dialog_worker(void *arg)
 {
     (void)arg;
@@ -927,6 +1096,9 @@ static void ai_dialog_worker(void *arg)
         xSemaphoreTake(s_control_mutex, portMAX_DELAY);
         packet_t p;
         while (xQueueReceive(s_control_queue, &p, 0) == pdTRUE) { process_text(&p); free(p.data); }
+        if (atomic_exchange(&s_interrupt_requested, false)) {
+            interrupt_playback();
+        }
         if (atomic_exchange(&s_wake_requested, false) &&
             ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_IDLE) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_WAKE_DETECTED);
@@ -1006,9 +1178,11 @@ esp_err_t ai_dialog_init(void)
     s_encoder_mutex = xSemaphoreCreateMutex(); s_pcm_mutex = xSemaphoreCreateMutex(); s_output_mutex = xSemaphoreCreateMutex();
     s_opus_mutex = xSemaphoreCreateMutex(); s_opus_data_sem = xSemaphoreCreateBinary();
     s_vad = vad_create((vad_mode_t)CONFIG_AI_DIALOG_VAD_MODE);
+    s_interrupt_vad = vad_create((vad_mode_t)CONFIG_AI_DIALOG_VAD_MODE);
     TaskHandle_t tasks[4] = {0};
     if (!s_control_queue || !s_encode_queue || !s_pcm_queue || !s_control_mutex || !s_capture_mutex ||
-        !s_encoder_mutex || !s_pcm_mutex || !s_output_mutex || !s_opus_mutex || !s_opus_data_sem || !s_vad ||
+        !s_encoder_mutex || !s_pcm_mutex || !s_output_mutex || !s_opus_mutex || !s_opus_data_sem ||
+        !s_vad || !s_interrupt_vad ||
         opus_ring_init() != ESP_OK) goto fail;
     coze_app_config_t coze_config = {
         .on_event = on_coze_event,
@@ -1038,6 +1212,7 @@ fail:
     if (s_decoder) { (void)esp_opus_dec_close(s_decoder); s_decoder = NULL; }
     if (s_encoder) { esp_opus_enc_close(s_encoder); s_encoder = NULL; }
     if (s_vad) vad_destroy(s_vad);
+    if (s_interrupt_vad) vad_destroy(s_interrupt_vad);
     opus_ring_deinit();
     QueueHandle_t queues[] = {s_control_queue, s_pcm_queue};
     for (unsigned i = 0; i < 2; ++i) if (queues[i]) vQueueDelete(queues[i]);
@@ -1053,9 +1228,32 @@ void ai_dialog_on_wake_detected(void)
 void ai_dialog_on_pcm(const int16_t *samples, size_t count, void *context)
 {
     (void)context;
-    if (!samples || !count || !atomic_load(&s_initialized) || !ai_dialog_logic_can_capture()) return;
+    if (!samples || !count || !atomic_load(&s_initialized)) return;
+    const bool capture_allowed = ai_dialog_logic_can_capture();
+    const bool playback_active = playing();
+    if (!capture_allowed && !playback_active) return;
     atomic_fetch_add(&s_produced_samples, count);
     if (xSemaphoreTake(s_capture_mutex, 0) != pdTRUE) { atomic_fetch_add(&s_capture_drops, 1); return; }
+    if (playback_active && !ai_dialog_logic_can_capture()) {
+        /*
+         * 播放期间不把麦克风数据送入正常上行队列，避免用户尚未确认说话
+         * 时污染当前 turn；只拼成 60 ms 帧交给本地打断检测器。
+         */
+        while (count) {
+            size_t n = FRAME_SAMPLES - s_captured;
+            if (n > count) n = count;
+            memcpy(s_capture_frame.samples + s_captured, samples, n * sizeof(int16_t));
+            samples += n;
+            count -= n;
+            s_captured += n;
+            if (s_captured == FRAME_SAMPLES) {
+                inspect_playback_capture(s_capture_frame.samples, FRAME_SAMPLES);
+                s_captured = 0;
+            }
+        }
+        xSemaphoreGive(s_capture_mutex);
+        return;
+    }
     if (ai_dialog_logic_can_capture()) {
         while (count) {
             size_t n = FRAME_SAMPLES - s_captured; if (n > count) n = count;

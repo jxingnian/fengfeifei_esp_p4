@@ -5,5 +5,6 @@ idf_component_register(
         "."
     REQUIRES
         audio_driver
+        esp-sr
         freertos
 )

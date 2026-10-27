@@ -15,6 +15,11 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 
+/*
+ * 音频服务统一承担 ESP-SR AEC：读取麦克风时输出去回声 PCM，写入扬声器时
+ * 同步保存播放参考 PCM，避免上层组件直接使用未经处理的麦克风数据。
+ */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
