@@ -122,6 +122,16 @@ static void coze_app_event_callback(
         }
         break;
 
+    case ESP_COZE_CHAT_EVENT_CHAT_SPEECH_STARTED:
+        ESP_LOGI(TAG, "turn=%u speech_started (server VAD)", s_turn);
+        coze_app_emit(COZE_APP_EVENT_SPEECH_STARTED, NULL, 0, 0);
+        break;
+
+    case ESP_COZE_CHAT_EVENT_CHAT_SPEECH_STOPED:
+        ESP_LOGI(TAG, "turn=%u speech_stopped (server VAD)", s_turn);
+        coze_app_emit(COZE_APP_EVENT_SPEECH_STOPPED, NULL, 0, 0);
+        break;
+
     case ESP_COZE_CHAT_EVENT_WS_EVENT:
         if (event_data != NULL) {
             const esp_coze_ws_event_t *ws_event =
@@ -283,6 +293,6 @@ esp_err_t coze_app_get_audio_config(coze_app_audio_config_t *config)
     config->output_bits_per_sample = COZE_APP_BITS_PER_SAMPLE;
     config->input_frame_us = COZE_APP_INPUT_FRAME_MS * 1000U;
     config->output_frame_us = COZE_APP_OUTPUT_FRAME_MS * 1000U;
-    config->server_vad = false;
+    config->server_vad = true;  // 启用服务器VAD
     return ESP_OK;
 }

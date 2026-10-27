@@ -464,7 +464,20 @@ static void process_text(packet_t *packet)
     if (!root) return;
     const char *type = json_str(root, "type");
     if (ai_dialog_logic_is_session_active() && json_uint(root, "turnId") == atomic_load(&s_turn)) {
-        if (!strcmp(type, "audio_start") &&
+        if (!strcmp(type, "speech_started") && s_server_vad &&
+            ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING) {
+            atomic_store(&s_speech_started, true);
+            ESP_LOGI(TAG, "turn=%u server VAD detected speech_started", atomic_load(&s_turn));
+        } else if (!strcmp(type, "speech_stopped") && s_server_vad &&
+                   ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING) {
+            atomic_store(&s_wait_since, now_ms());
+            (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_TURN_COMMITTED);
+            if (coze_app_commit_audio(atomic_load(&s_turn)) != ESP_OK) {
+                atomic_store(&s_failure, 1);
+            }
+            ESP_LOGI(TAG, "turn=%u server VAD detected speech_stopped, committed audio",
+                     atomic_load(&s_turn));
+        } else if (!strcmp(type, "audio_start") &&
             (ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_WAITING_REPLY ||
              (s_server_vad && ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING))) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
@@ -528,6 +541,44 @@ static void on_coze_event(const coze_app_event_t *event, void *context)
         } else if (evicted_count != 0) {
             /* 200 KB 已满时只淘汰最旧完整帧，统计被淘汰的帧数量。 */
             atomic_fetch_add(&s_rx_drops, evicted_count);
+        }
+        return;
+    }
+
+    if (event->type == COZE_APP_EVENT_SPEECH_STARTED) {
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "{\"type\":\"speech_started\",\"turnId\":%u}", event->turn);
+        packet_t packet = {
+            .length = strlen(message),
+            .data = malloc(strlen(message)),
+            .turn = event->turn,
+            .seq = 0,
+        };
+        if (packet.data != NULL) {
+            memcpy(packet.data, message, packet.length);
+            if (xQueueSendToFront(s_control_queue, &packet, 0) != pdTRUE) {
+                free(packet.data);
+            }
+        }
+        return;
+    }
+
+    if (event->type == COZE_APP_EVENT_SPEECH_STOPPED) {
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "{\"type\":\"speech_stopped\",\"turnId\":%u}", event->turn);
+        packet_t packet = {
+            .length = strlen(message),
+            .data = malloc(strlen(message)),
+            .turn = event->turn,
+            .seq = 0,
+        };
+        if (packet.data != NULL) {
+            memcpy(packet.data, message, packet.length);
+            if (xQueueSendToFront(s_control_queue, &packet, 0) != pdTRUE) {
+                free(packet.data);
+            }
         }
         return;
     }
