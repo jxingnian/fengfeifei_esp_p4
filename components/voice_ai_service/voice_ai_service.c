@@ -51,7 +51,7 @@ static atomic_uint s_completed_seq, s_encoder_stack_free, s_decoder_stack_free, 
 static atomic_bool s_end_seen;
 static atomic_llong s_listen_since, s_wait_since, s_audio_since;
 static unsigned s_end_sequence;
-static bool s_wait_warning, s_input_opus, s_output_opus;
+static bool s_wait_warning, s_input_opus, s_output_opus, s_server_vad;
 static capture_t s_capture_frame;
 static size_t s_captured;
 static void *s_encoder, *s_decoder;
@@ -169,10 +169,13 @@ static void ready(cJSON *root)
     atomic_store(&s_ready, false);
     if (atomic_load(&s_session_active)) finish("new audio configuration", false, true);
     cJSON *in = cJSON_GetObjectItemCaseSensitive(root, "input"), *out = cJSON_GetObjectItemCaseSensitive(root, "output");
-    if (json_uint(root, "voiceProtocol") != 2 || strcmp(json_str(root, "turnDetection"), "client_interrupt") ||
+    if (json_uint(root, "voiceProtocol") != 2 ||
+        (strcmp(json_str(root, "turnDetection"), "client_interrupt") && strcmp(json_str(root, "turnDetection"), "server_vad")) ||
         strcmp(json_str(root, "provider"), "coze_realtime") || !audio_format(in) || !audio_format(out)) {
-        ESP_LOGE(TAG, "Require backend voiceProtocol=2/client_interrupt, PCM/Opus 16k mono16; upgrade backend first"); return;
+        ESP_LOGE(TAG, "Require backend voiceProtocol=2/client_interrupt-or-server_vad, PCM/Opus 16k mono16; upgrade backend first"); return;
     }
+    // server_vad 下设备持续上传音频，由 Coze 服务端决定语音结束；client_interrupt 仍使用设备本地 VAD。
+    s_server_vad = !strcmp(json_str(root, "turnDetection"), "server_vad");
     cJSON *frame = cJSON_GetObjectItemCaseSensitive(out, "frameSizeMs");
     unsigned us = cJSON_IsNumber(frame) ? (unsigned)(frame->valuedouble * 1000) : 20000;
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY); xSemaphoreTake(s_decoder_mutex, portMAX_DELAY);
@@ -181,7 +184,8 @@ static void ready(cJSON *root)
     cloud_gateway_status_t status;
     if (ok && cloud_gateway_get_status(&status) == ESP_OK && status.state == CLOUD_GATEWAY_READY) {
         atomic_store(&s_ready_epoch, status.connection_epoch); atomic_store(&s_ready, true);
-        ESP_LOGI(TAG, "Ready v2: input=%s output=%s, local VAD, output=%uus credit=600ms/24packets", json_str(in, "codec"), json_str(out, "codec"), us);
+        ESP_LOGI(TAG, "Ready v2: input=%s output=%s, turn_detection=%s, output=%uus credit=600ms/24packets",
+            json_str(in, "codec"), json_str(out, "codec"), s_server_vad ? "server_vad" : "client_interrupt", us);
     } else ESP_LOGE(TAG, "Audio codec initialization failed");
 }
 static bool begin_turn(void)
@@ -192,7 +196,8 @@ static bool begin_turn(void)
     atomic_store(&s_listen_since, now_ms());
     if (event("audio_start", false) != ESP_OK) { atomic_store(&s_failure, 1); return false; }
     atomic_store(&s_state, AI_LISTEN);
-    ESP_LOGI(TAG, "turn=%u listening: pre-roll=300ms tail=%dms no-speech=%dms max=%dms", atomic_load(&s_turn),
+    ESP_LOGI(TAG, "turn=%u listening: mode=%s pre-roll=300ms tail=%dms no-speech=%dms max=%dms", atomic_load(&s_turn),
+        s_server_vad ? "server_vad" : "client_interrupt",
         CONFIG_VOICE_AI_TAIL_SILENCE_MS, CONFIG_VOICE_AI_NO_SPEECH_MS, CONFIG_VOICE_AI_MAX_TURN_MS);
     return true;
 }
@@ -203,7 +208,8 @@ static void process_text(packet_t *packet)
     const char *type = json_str(root, "type");
     if (!strcmp(type, "ready")) ready(root);
     else if (atomic_load(&s_session_active) && json_uint(root, "turnId") == atomic_load(&s_turn)) {
-        if (!strcmp(type, "audio_start") && atomic_load(&s_state) == AI_WAIT) {
+        if (!strcmp(type, "audio_start") && (atomic_load(&s_state) == AI_WAIT ||
+            (s_server_vad && atomic_load(&s_state) == AI_LISTEN))) {
             if (voice_service_stop() != ESP_OK || voice_board_audio_set_output_enabled(true) != ESP_OK) finish("speaker/capture transition failed", true, true);
             else {
                 atomic_store(&s_audio_since, now_ms()); atomic_store(&s_state, AI_PLAY);
@@ -250,26 +256,34 @@ static void voice_ai_encode_worker(void *arg)
         if (xQueueReceive(s_encode_queue, &frame, portMAX_DELAY) != pdTRUE) continue;
         xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
         if (!capture_current(&frame)) { xSemaphoreGive(s_encoder_mutex); continue; }
-        if (generation != frame.generation) { generation = frame.generation; turn = (voice_turn_t){0}; ring = count = 0; vad_reset_trigger(s_vad); }
-        unsigned speech = 0;
-        for (unsigned i = 0; i < FRAME_SAMPLES; i += 320) if (vad_process(s_vad, frame.samples + i, 16000, 20) == VAD_SPEECH) speech++;
-        bool already_started = turn.started;
-        voice_turn_event_t result = voice_turn_feed(&turn, speech >= 2, FRAME_MS,
-            CONFIG_VOICE_AI_TAIL_SILENCE_MS, CONFIG_VOICE_AI_NO_SPEECH_MS, CONFIG_VOICE_AI_MAX_TURN_MS);
-        if (!already_started) { s_pre_roll[ring] = frame; ring = (ring + 1) % PRE_ROLL_FRAMES; if (count < PRE_ROLL_FRAMES) count++; }
-        if (result == TURN_STARTED) {
-            atomic_store(&s_speech_started, true);
-            ESP_LOGI(TAG, "turn=%u speech_start at +%ums", atomic_load(&s_turn), turn.elapsed_ms);
-            unsigned oldest = (ring + PRE_ROLL_FRAMES - count) % PRE_ROLL_FRAMES;
-            for (unsigned i = 0; i < count; ++i) encode_send(&s_pre_roll[(oldest + i) % PRE_ROLL_FRAMES]);
-        } else if (already_started) encode_send(&frame);
-        if (result == TURN_COMMIT && capture_current(&frame)) {
-            /* Current encoded frame includes the trailing silence. Partial raw
-             * capture after this boundary belongs to no submitted turn. */
-            atomic_store(&s_wait_since, now_ms()); atomic_store(&s_state, AI_WAIT);
-            if (event("audio_end", true) != ESP_OK) atomic_store(&s_failure, 1);
-            ESP_LOGI(TAG, "turn=%u speech_end/commit at +%ums tail=%ums; upload stopped", atomic_load(&s_turn), turn.elapsed_ms, turn.silence_ms);
-        } else if (result == TURN_EMPTY) atomic_store(&s_failure, 2);
+        if (generation != frame.generation) {
+            generation = frame.generation; turn = (voice_turn_t){0}; ring = count = 0;
+            if (!s_server_vad) vad_reset_trigger(s_vad);
+        }
+        if (s_server_vad) {
+            // server_vad 要求从唤醒后的第一帧开始连续上传，不能经过本地 VAD 筛选或发送 audio_end。
+            encode_send(&frame);
+        } else {
+            unsigned speech = 0;
+            for (unsigned i = 0; i < FRAME_SAMPLES; i += 320) if (vad_process(s_vad, frame.samples + i, 16000, 20) == VAD_SPEECH) speech++;
+            bool already_started = turn.started;
+            voice_turn_event_t result = voice_turn_feed(&turn, speech >= 2, FRAME_MS,
+                CONFIG_VOICE_AI_TAIL_SILENCE_MS, CONFIG_VOICE_AI_NO_SPEECH_MS, CONFIG_VOICE_AI_MAX_TURN_MS);
+            if (!already_started) { s_pre_roll[ring] = frame; ring = (ring + 1) % PRE_ROLL_FRAMES; if (count < PRE_ROLL_FRAMES) count++; }
+            if (result == TURN_STARTED) {
+                atomic_store(&s_speech_started, true);
+                ESP_LOGI(TAG, "turn=%u speech_start at +%ums", atomic_load(&s_turn), turn.elapsed_ms);
+                unsigned oldest = (ring + PRE_ROLL_FRAMES - count) % PRE_ROLL_FRAMES;
+                for (unsigned i = 0; i < count; ++i) encode_send(&s_pre_roll[(oldest + i) % PRE_ROLL_FRAMES]);
+            } else if (already_started) encode_send(&frame);
+            if (result == TURN_COMMIT && capture_current(&frame)) {
+                /* Current encoded frame includes the trailing silence. Partial raw
+                 * capture after this boundary belongs to no submitted turn. */
+                atomic_store(&s_wait_since, now_ms()); atomic_store(&s_state, AI_WAIT);
+                if (event("audio_end", true) != ESP_OK) atomic_store(&s_failure, 1);
+                ESP_LOGI(TAG, "turn=%u speech_end/commit at +%ums tail=%ums; upload stopped", atomic_load(&s_turn), turn.elapsed_ms, turn.silence_ms);
+            } else if (result == TURN_EMPTY) atomic_store(&s_failure, 2);
+        }
         xSemaphoreGive(s_encoder_mutex);
     }
 }
@@ -399,7 +413,8 @@ static void voice_ai_worker(void *arg)
                 atomic_store(&s_ready, false); finish("connection lost", false, true);
             }
             int64_t now = now_ms(); int state = atomic_load(&s_state);
-            if (state == AI_LISTEN && !atomic_load(&s_speech_started) && now - atomic_load(&s_listen_since) > CONFIG_VOICE_AI_NO_SPEECH_MS + 300) finish("no speech", true, true);
+            // server_vad 的录音阶段可能包含较长静音，不能用设备本地的无语音超时结束会话。
+            if (state == AI_LISTEN && !s_server_vad && !atomic_load(&s_speech_started) && now - atomic_load(&s_listen_since) > CONFIG_VOICE_AI_NO_SPEECH_MS + 300) finish("no speech", true, true);
             if (state == AI_LISTEN && now - atomic_load(&s_listen_since) > CONFIG_VOICE_AI_MAX_TURN_MS + 2000) finish("capture watchdog", true, true);
             if (state == AI_WAIT) {
                 int64_t waited = now - atomic_load(&s_wait_since);
