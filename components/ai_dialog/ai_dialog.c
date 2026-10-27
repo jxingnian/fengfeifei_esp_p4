@@ -472,6 +472,18 @@ static void process_text(packet_t *packet)
                    ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING) {
             atomic_store(&s_wait_since, now_ms());
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_TURN_COMMITTED);
+
+            /* 提前启用扬声器，避免后续 audio_start 时音频数据竞态导致前几帧丢失 */
+            if (wake_word_stop() != ESP_OK ||
+                audio_service_set_output_enabled(
+                    AUDIO_SERVICE_OWNER_AI_DIALOG,
+                    true
+                ) != ESP_OK) {
+                ESP_LOGW(TAG, "turn=%u 提前启用扬声器失败", atomic_load(&s_turn));
+            } else {
+                ESP_LOGI(TAG, "turn=%u 扬声器已提前启用", atomic_load(&s_turn));
+            }
+
             if (coze_app_commit_audio(atomic_load(&s_turn)) != ESP_OK) {
                 atomic_store(&s_failure, 1);
             }
@@ -481,17 +493,22 @@ static void process_text(packet_t *packet)
             (ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_WAITING_REPLY ||
              (s_server_vad && ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING))) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
-            if (wake_word_stop() != ESP_OK ||
-                audio_service_set_output_enabled(
-                    AUDIO_SERVICE_OWNER_AI_DIALOG,
-                    true
-                ) != ESP_OK) {
-                finish("speaker/capture transition failed", true, true);
+
+            /* server_vad 模式下扬声器已在 speech_stopped 提前启用；非 server_vad 模式在此启用 */
+            if (!s_server_vad) {
+                if (wake_word_stop() != ESP_OK ||
+                    audio_service_set_output_enabled(
+                        AUDIO_SERVICE_OWNER_AI_DIALOG,
+                        true
+                    ) != ESP_OK) {
+                    finish("speaker/capture transition failed", true, true);
+                    goto audio_start_done;
+                }
             }
-            else {
-                atomic_store(&s_audio_since, now_ms());
-                ESP_LOGI(TAG, "turn=%u first_audio after commit=%lldms", atomic_load(&s_turn), now_ms() - atomic_load(&s_wait_since));
-            }
+
+            atomic_store(&s_audio_since, now_ms());
+            ESP_LOGI(TAG, "turn=%u first_audio after commit=%lldms", atomic_load(&s_turn), now_ms() - atomic_load(&s_wait_since));
+            audio_start_done:;
         } else if (!strcmp(type, "audio_end") && playing()) {
             s_end_sequence = json_uint(root, "lastSequence");
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_ENDED);
