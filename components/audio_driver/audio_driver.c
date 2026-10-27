@@ -52,15 +52,72 @@ static const audio_codec_data_if_t *s_i2s_data_if;
 static const audio_codec_gpio_if_t *s_gpio_if;
 static const audio_codec_ctrl_if_t *s_ctrl_if;
 static const audio_codec_if_t *s_codec_if;
-static esp_codec_dev_handle_t s_microphone;
-static esp_codec_dev_handle_t s_speaker;
+static esp_codec_dev_handle_t s_audio_device;
+static SemaphoreHandle_t s_device_mutex;
+static bool s_input_enabled;
+static bool s_output_enabled;
 static bool s_initialized;
 
-static esp_err_t restore_output_level(void)
+/**
+ * @brief 更新音频设备状态：根据输入/输出使能标志创建或销毁设备。
+ */
+static esp_err_t update_device_state(void)
 {
-    esp_err_t error = esp_codec_dev_set_out_vol(s_speaker, CONFIG_AUDIO_DRIVER_SPEAKER_VOLUME);
-    if (error == ESP_OK) error = esp_codec_dev_set_out_mute(s_speaker, false);
-    return error;
+    const bool need_device = s_input_enabled || s_output_enabled;
+
+    if (need_device && s_audio_device == NULL) {
+        esp_codec_dev_cfg_t device_config = {
+            .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
+            .codec_if = s_codec_if,
+            .data_if = s_i2s_data_if,
+        };
+        s_audio_device = esp_codec_dev_new(&device_config);
+        if (s_audio_device == NULL) {
+            ESP_LOGE(TAG, "创建音频设备失败");
+            return ESP_ERR_NO_MEM;
+        }
+
+        esp_codec_dev_sample_info_t sample_info = {
+            .sample_rate = AUDIO_SAMPLE_RATE_HZ,
+            .channel = I2S_SLOT_MODE_MONO,
+            .bits_per_sample = 16,
+        };
+        esp_err_t error = esp_codec_dev_open(s_audio_device, &sample_info);
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "打开音频设备失败：%s", esp_err_to_name(error));
+            esp_codec_dev_delete(s_audio_device);
+            s_audio_device = NULL;
+            return error;
+        }
+
+        error = esp_codec_dev_set_in_gain(s_audio_device, CONFIG_WAKE_WORD_MIC_GAIN_DB);
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "设置麦克风增益失败：%s", esp_err_to_name(error));
+        }
+
+        error = esp_codec_dev_set_out_vol(s_audio_device, CONFIG_AUDIO_DRIVER_SPEAKER_VOLUME);
+        if (error == ESP_OK) {
+            error = esp_codec_dev_set_out_mute(s_audio_device, false);
+        }
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "设置扬声器音量失败：%s", esp_err_to_name(error));
+        }
+
+        ESP_LOGI(TAG, "音频设备已打开：input=%d, output=%d", s_input_enabled, s_output_enabled);
+    } else if (!need_device && s_audio_device != NULL) {
+        (void)esp_codec_dev_close(s_audio_device);
+        esp_codec_dev_delete(s_audio_device);
+        s_audio_device = NULL;
+        ESP_LOGI(TAG, "音频设备已关闭");
+    }
+
+    if (s_output_enabled) {
+        gpio_set_level(AUDIO_PA_GPIO, 1);
+    } else {
+        gpio_set_level(AUDIO_PA_GPIO, 0);
+    }
+
+    return ESP_OK;
 }
 
 /**
@@ -68,15 +125,10 @@ static esp_err_t restore_output_level(void)
  */
 static void audio_driver_cleanup(void)
 {
-    if (s_microphone != NULL) {
-        (void)esp_codec_dev_close(s_microphone);
-        esp_codec_dev_delete(s_microphone);
-        s_microphone = NULL;
-    }
-    if (s_speaker != NULL) {
-        (void)esp_codec_dev_close(s_speaker);
-        esp_codec_dev_delete(s_speaker);
-        s_speaker = NULL;
+    if (s_audio_device != NULL) {
+        (void)esp_codec_dev_close(s_audio_device);
+        esp_codec_dev_delete(s_audio_device);
+        s_audio_device = NULL;
     }
 
     if (s_codec_if != NULL) {
@@ -113,6 +165,13 @@ static void audio_driver_cleanup(void)
         s_i2c_bus = NULL;
     }
 
+    if (s_device_mutex != NULL) {
+        vSemaphoreDelete(s_device_mutex);
+        s_device_mutex = NULL;
+    }
+
+    s_input_enabled = false;
+    s_output_enabled = false;
     s_initialized = false;
 }
 
@@ -186,7 +245,7 @@ static esp_err_t audio_driver_init_i2s(void)
 }
 
 /**
- * @brief 创建 ES8311 输入 codec 设备。
+ * @brief 创建 ES8311 codec 接口（不立即创建设备）。
  */
 static esp_err_t audio_driver_init_codec(void)
 {
@@ -244,53 +303,7 @@ static esp_err_t audio_driver_init_codec(void)
         return ESP_FAIL;
     }
 
-    esp_codec_dev_cfg_t device_config = {
-        .dev_type = ESP_CODEC_DEV_TYPE_IN,
-        .codec_if = s_codec_if,
-        .data_if = s_i2s_data_if,
-    };
-    s_microphone = esp_codec_dev_new(&device_config);
-    if (s_microphone == NULL) {
-        audio_codec_delete_codec_if(s_codec_if);
-        audio_codec_delete_ctrl_if(s_ctrl_if);
-        audio_codec_delete_gpio_if(s_gpio_if);
-        s_codec_if = NULL;
-        s_ctrl_if = NULL;
-        s_gpio_if = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-
-    device_config.dev_type = ESP_CODEC_DEV_TYPE_OUT;
-    s_speaker = esp_codec_dev_new(&device_config);
-    if (s_speaker == NULL) return ESP_ERR_NO_MEM;
-
-    esp_codec_dev_sample_info_t sample_info = {
-        .sample_rate = AUDIO_SAMPLE_RATE_HZ,
-        .channel = I2S_SLOT_MODE_MONO,
-        .bits_per_sample = 16,
-    };
-    esp_err_t error = esp_codec_dev_open(s_microphone, &sample_info);
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "打开 ES8311 麦克风失败：%s", esp_err_to_name(error));
-        return error;
-    }
-    error = esp_codec_dev_open(s_speaker, &sample_info);
-    if (error != ESP_OK) return error;
-    error = restore_output_level();
-    if (error != ESP_OK) return error;
-    ESP_LOGI(TAG, "ES8311 speaker volume=%d, unmuted", CONFIG_AUDIO_DRIVER_SPEAKER_VOLUME);
-
-    /*
-     * 官方开发板录音示例提供 24 dB 麦克风增益选项。这里在设备打开后
-     * 立即应用同一增益，保证 MultiNet 接收到稳定的语音幅度。
-     */
-    error = esp_codec_dev_set_in_gain(s_microphone, CONFIG_WAKE_WORD_MIC_GAIN_DB);
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "设置 ES8311 麦克风增益失败：%s", esp_err_to_name(error));
-        return error;
-    }
-
-    ESP_LOGI(TAG, "ES8311 麦克风增益已设置为 %d dB", CONFIG_WAKE_WORD_MIC_GAIN_DB);
+    ESP_LOGI(TAG, "ES8311 codec 接口已创建");
     return ESP_OK;
 }
 
@@ -300,12 +313,21 @@ esp_err_t audio_driver_init(void)
         return ESP_OK;
     }
 
+    s_device_mutex = xSemaphoreCreateMutex();
+    if (s_device_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     esp_err_t error = gpio_set_direction(AUDIO_PA_GPIO, GPIO_MODE_OUTPUT);
     if (error != ESP_OK) {
+        vSemaphoreDelete(s_device_mutex);
+        s_device_mutex = NULL;
         return error;
     }
     error = gpio_set_level(AUDIO_PA_GPIO, 0);
     if (error != ESP_OK) {
+        vSemaphoreDelete(s_device_mutex);
+        s_device_mutex = NULL;
         return error;
     }
     error = audio_driver_init_i2c();
@@ -321,17 +343,43 @@ esp_err_t audio_driver_init(void)
         return error;
     }
 
+    s_input_enabled = false;
+    s_output_enabled = false;
     s_initialized = true;
+
+    /* 默认启用输入，用于唤醒词检测 */
+    error = audio_driver_set_input_enabled(true);
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "启用麦克风输入失败：%s", esp_err_to_name(error));
+        audio_driver_cleanup();
+        return error;
+    }
+
     ESP_LOGI(TAG, "ES8311 麦克风已启动：16 kHz、16 bit、单声道");
     return ESP_OK;
 }
 
 esp_err_t audio_driver_read(int16_t *samples, size_t sample_count)
 {
-    if (!s_initialized || s_microphone == NULL || samples == NULL || sample_count == 0) {
-        return ESP_ERR_INVALID_STATE;
+    if (!s_initialized || samples == NULL || sample_count == 0) {
+        return ESP_ERR_INVALID_ARG;
     }
-    return esp_codec_dev_read(s_microphone, samples, sample_count * sizeof(int16_t));
+
+    if (xSemaphoreTake(s_device_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t error = ESP_ERR_INVALID_STATE;
+    if (s_input_enabled && s_audio_device != NULL) {
+        error = esp_codec_dev_read(s_audio_device, samples, sample_count * sizeof(int16_t));
+    } else if (!s_input_enabled) {
+        ESP_LOGW(TAG, "尝试读取但输入未启用");
+    } else {
+        ESP_LOGE(TAG, "音频设备为 NULL");
+    }
+
+    xSemaphoreGive(s_device_mutex);
+    return error;
 }
 
 esp_err_t audio_driver_deinit(void)
@@ -342,18 +390,77 @@ esp_err_t audio_driver_deinit(void)
 
 esp_err_t audio_driver_write(const int16_t *samples, size_t sample_count)
 {
-    if (!s_initialized || s_speaker == NULL || samples == NULL || sample_count == 0) return ESP_ERR_INVALID_STATE;
-    return esp_codec_dev_write(s_speaker, (void *)samples, sample_count * sizeof(int16_t));
+    if (!s_initialized || samples == NULL || sample_count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xSemaphoreTake(s_device_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t error = ESP_ERR_INVALID_STATE;
+    if (s_output_enabled && s_audio_device != NULL) {
+        error = esp_codec_dev_write(s_audio_device, (void *)samples, sample_count * sizeof(int16_t));
+    } else if (!s_output_enabled) {
+        ESP_LOGW(TAG, "尝试写入但输出未启用");
+    } else {
+        ESP_LOGE(TAG, "音频设备为 NULL");
+    }
+
+    xSemaphoreGive(s_device_mutex);
+    return error;
+}
+
+esp_err_t audio_driver_set_input_enabled(bool enabled)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(s_device_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (s_input_enabled == enabled) {
+        xSemaphoreGive(s_device_mutex);
+        return ESP_OK;
+    }
+
+    s_input_enabled = enabled;
+    esp_err_t error = update_device_state();
+
+    xSemaphoreGive(s_device_mutex);
+
+    if (error == ESP_OK) {
+        ESP_LOGI(TAG, "麦克风输入已%s", enabled ? "启用" : "禁用");
+    }
+    return error;
 }
 
 esp_err_t audio_driver_set_output_enabled(bool enabled)
 {
-    if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    if (enabled) {
-        esp_err_t error = restore_output_level();
-        if (error != ESP_OK) return error;
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
     }
-    return gpio_set_level(AUDIO_PA_GPIO, enabled ? 1 : 0);
+
+    if (xSemaphoreTake(s_device_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (s_output_enabled == enabled) {
+        xSemaphoreGive(s_device_mutex);
+        return ESP_OK;
+    }
+
+    s_output_enabled = enabled;
+    esp_err_t error = update_device_state();
+
+    xSemaphoreGive(s_device_mutex);
+
+    if (error == ESP_OK) {
+        ESP_LOGI(TAG, "扬声器输出已%s", enabled ? "启用" : "禁用");
+    }
+    return error;
 }
 
 esp_err_t audio_driver_drain(void)

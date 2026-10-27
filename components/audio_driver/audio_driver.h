@@ -37,6 +37,11 @@ esp_err_t audio_driver_set_output_enabled(bool enabled);
 esp_err_t audio_driver_drain(void);
 
 /**
+ * @brief 启用或禁用麦克风输入。
+ */
+esp_err_t audio_driver_set_input_enabled(bool enabled);
+
+/**
  * @brief 关闭并释放音频资源。
  */
 esp_err_t audio_driver_deinit(void);
