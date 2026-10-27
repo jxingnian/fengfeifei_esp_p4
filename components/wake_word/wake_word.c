@@ -292,8 +292,7 @@ static void wake_word_recognition_task(void *argument)
 
             ESP_LOGI(TAG, "检测到唤醒词：你好小飞，概率：%.3f",
                      result->prob[result_index]);
-            /* 先切换采集模式，再通知业务层，保证唤醒回调返回后立即上传下一帧 PCM。 */
-            s_conversation_active = true;
+            /* 先通知业务层，业务层调用 wake_word_start_conversation() 时会切换采集模式并转移所有权 */
             wake_word_emit_event(
                 WAKE_WORD_EVENT_WAKE_DETECTED,
                 result->command_id[result_index],
