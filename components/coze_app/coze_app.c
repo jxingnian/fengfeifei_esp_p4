@@ -61,11 +61,11 @@ static void coze_app_emit(
 }
 
 /**
- * @brief 接收 Coze SDK 已经解码的下行 PCM。
+ * @brief 接收 Coze SDK 完成 Base64 解码后的下行 Opus 帧。
  *
- * esp_coze_chat.h 明确规定 audio_callback 返回的是 decoded bytes，不能在
- * ai_dialog 中再次按 Opus 解码。线路仍使用 Opus 以节省带宽，应用边界统一
- * 传递 16 kHz、单声道、16 bit PCM，这一边界消除了重复解码导致的丢帧。
+ * esp_coze_chat.h 中的 decoded bytes 指 Base64 解码后的字节，不代表已经完成
+ * Opus 解码。当前回调只把完整 Opus 帧转交给 ai_dialog，不能在 WebSocket 任务
+ * 中执行解码或阻塞等待播放。
  */
 static void coze_app_audio_callback(
     const uint8_t *data,
@@ -273,8 +273,8 @@ esp_err_t coze_app_get_audio_config(coze_app_audio_config_t *config)
     }
 
     config->input_opus = true;
-    /* Coze SDK 的 audio_callback 已经返回解码后的 PCM。 */
-    config->output_opus = false;
+    /* Coze SDK 回调返回 Base64 解码后的 Opus，应用层负责实时解码为 PCM。 */
+    config->output_opus = true;
     config->input_sample_rate = COZE_APP_SAMPLE_RATE_HZ;
     config->output_sample_rate = COZE_APP_SAMPLE_RATE_HZ;
     config->input_channels = COZE_APP_CHANNELS;

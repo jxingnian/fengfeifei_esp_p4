@@ -18,6 +18,8 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_vad.h"
+#include "decoder/impl/esp_opus_dec.h"
+#include "esp_audio_dec.h"
 #include "encoder/impl/esp_opus_enc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -34,18 +36,26 @@
 #define FRAME_MS 60U
 #define PRE_ROLL_FRAMES 5U
 #define ENCODE_QUEUE_LENGTH 16U /* 960ms raw capture */
-#define AUDIO_QUEUE_LENGTH 96U /* 为 Coze 下行突发保留约 1.9 秒 PCM 队列空间。 */
 #define PCM_QUEUE_LENGTH 4U
 #define MAX_PACKET 4096U
 #define MAX_PCM_BYTES 8192U
 #define CONTROL_QUEUE_LENGTH 32U
+#define OPUS_RING_BUFFER_BYTES (200U * 1024U)
+#define OPUS_RING_DESCRIPTOR_COUNT 4096U
 
 typedef struct { unsigned generation; int16_t samples[FRAME_SAMPLES]; } capture_t;
 typedef struct { size_t length; uint8_t *data; unsigned turn, seq; } packet_t;
 typedef struct { size_t length; uint8_t *data; unsigned generation, turn, seq; } pcm_t;
+typedef struct {
+    size_t offset;
+    size_t length;
+    unsigned turn;
+    unsigned seq;
+} opus_packet_desc_t;
 static const char *TAG = "ai_dialog";
-static QueueHandle_t s_control_queue, s_audio_queue, s_encode_queue, s_pcm_queue;
+static QueueHandle_t s_control_queue, s_encode_queue, s_pcm_queue;
 static SemaphoreHandle_t s_control_mutex, s_encoder_mutex, s_pcm_mutex, s_output_mutex, s_capture_mutex;
+static SemaphoreHandle_t s_opus_mutex, s_opus_data_sem;
 static atomic_bool s_initialized, s_ready, s_wake_requested, s_restore_pending, s_speech_started;
 static atomic_uint s_generation, s_turn, s_failure;
 static atomic_uint s_produced_samples, s_encoded, s_decoded, s_written, s_tx_bytes;
@@ -58,9 +68,17 @@ static bool s_wait_warning, s_input_opus, s_server_vad;
 static capture_t s_capture_frame;
 static size_t s_captured;
 static void *s_encoder;
+static void *s_decoder;
 static vad_handle_t s_vad;
 static _Alignas(16) uint8_t s_encoded_buffer[MAX_PACKET];
 static capture_t s_pre_roll[PRE_ROLL_FRAMES]; /* encoder owns ring */
+static uint8_t *s_opus_ring;
+static opus_packet_desc_t *s_opus_descriptors;
+static size_t s_opus_write_offset;
+static size_t s_opus_used_bytes;
+static size_t s_opus_write_desc;
+static size_t s_opus_read_desc;
+static size_t s_opus_desc_count;
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 static unsigned json_uint(cJSON *root, const char *key)
 {
@@ -81,11 +99,235 @@ static bool current(unsigned generation, unsigned turn)
 {
     return ai_dialog_logic_is_session_active() && generation == atomic_load(&s_generation) && turn == atomic_load(&s_turn);
 }
-static void clear_packets(QueueHandle_t queue)
+/**
+ * @brief 在环形缓冲区中复制一段数据，允许数据跨越物理尾部。
+ *
+ * Opus 每帧都必须保持完整边界，因此环形缓冲区只保存字节，实际帧边界
+ * 由 s_opus_descriptors 记录。写入和读取都通过本函数处理回绕。
+ */
+static void opus_ring_copy(
+    uint8_t *buffer,
+    size_t offset,
+    uint8_t *data,
+    size_t length,
+    bool write_to_ring
+)
 {
-    packet_t p;
-    while (xQueueReceive(queue, &p, 0) == pdTRUE) free(p.data);
+    size_t first = OPUS_RING_BUFFER_BYTES - offset;
+    if (first > length) {
+        first = length;
+    }
+    if (write_to_ring) {
+        memcpy(buffer + offset, data, first);
+        if (length > first) {
+            memcpy(buffer, data + first, length - first);
+        }
+    } else {
+        memcpy(data, buffer + offset, first);
+        if (length > first) {
+            memcpy(data + first, buffer, length - first);
+        }
+    }
 }
+
+/**
+ * @brief 丢弃环形缓冲区中最旧的一帧 Opus。
+ *
+ * 服务端下发速度高于解码/播放速度时，必须按完整帧淘汰，不能只移动几个
+ * 字节，否则后续 Opus 帧边界会损坏，解码器会连续报错。
+ */
+static void opus_ring_discard_oldest_locked(void)
+{
+    if (s_opus_desc_count == 0) {
+        return;
+    }
+    const opus_packet_desc_t *descriptor = &s_opus_descriptors[s_opus_read_desc];
+    s_opus_used_bytes -= descriptor->length;
+    s_opus_read_desc = (s_opus_read_desc + 1U) % OPUS_RING_DESCRIPTOR_COUNT;
+    s_opus_desc_count--;
+}
+
+/**
+ * @brief 把一帧 Opus 复制到 PSRAM 环形缓冲区。
+ *
+ * 该函数运行在 Coze WebSocket 任务中，只允许零等待获取互斥锁；当缓冲区
+ * 空间不足时淘汰最旧完整帧，确保 WebSocket 接收任务不会被播放阻塞。
+ */
+static bool opus_ring_push(
+    const uint8_t *data,
+    size_t length,
+    unsigned turn,
+    unsigned sequence,
+    unsigned *evicted_count
+)
+{
+    if (evicted_count != NULL) {
+        *evicted_count = 0;
+    }
+    if (s_opus_ring == NULL || s_opus_descriptors == NULL ||
+        s_opus_mutex == NULL || data == NULL || length == 0 ||
+        length > OPUS_RING_BUFFER_BYTES || length > MAX_PACKET) {
+        return false;
+    }
+    if (xSemaphoreTake(s_opus_mutex, 0) != pdTRUE) {
+        return false;
+    }
+
+    unsigned evicted = 0;
+    while (s_opus_desc_count >= OPUS_RING_DESCRIPTOR_COUNT ||
+           s_opus_used_bytes + length > OPUS_RING_BUFFER_BYTES) {
+        if (s_opus_desc_count == 0) {
+            xSemaphoreGive(s_opus_mutex);
+            return false;
+        }
+        opus_ring_discard_oldest_locked();
+        evicted++;
+    }
+
+    const size_t write_offset = s_opus_write_offset;
+    opus_ring_copy(s_opus_ring, write_offset, (uint8_t *)data, length, true);
+    s_opus_descriptors[s_opus_write_desc] = (opus_packet_desc_t){
+        .offset = write_offset,
+        .length = length,
+        .turn = turn,
+        .seq = sequence,
+    };
+    s_opus_write_offset = (write_offset + length) % OPUS_RING_BUFFER_BYTES;
+    s_opus_used_bytes += length;
+    s_opus_write_desc = (s_opus_write_desc + 1U) % OPUS_RING_DESCRIPTOR_COUNT;
+    s_opus_desc_count++;
+    xSemaphoreGive(s_opus_mutex);
+    if (evicted_count != NULL) {
+        *evicted_count = evicted;
+    }
+    xSemaphoreGive(s_opus_data_sem);
+    return true;
+}
+
+/**
+ * @brief 从 PSRAM 环形缓冲区取出一帧完整 Opus 数据。
+ *
+ * 取出时立即释放环形缓冲区空间，解码过程在互斥锁外执行，避免解码耗时
+ * 阻塞 Coze 回调继续接收后续帧。
+ */
+static bool opus_ring_pop(
+    uint8_t *data,
+    size_t capacity,
+    size_t *length,
+    unsigned *turn,
+    unsigned *sequence
+)
+{
+    if (data == NULL || length == NULL || turn == NULL || sequence == NULL ||
+        s_opus_mutex == NULL || s_opus_ring == NULL || s_opus_descriptors == NULL ||
+        xSemaphoreTake(s_opus_mutex, 0) != pdTRUE) {
+        return false;
+    }
+    if (s_opus_desc_count == 0) {
+        xSemaphoreGive(s_opus_mutex);
+        return false;
+    }
+
+    const opus_packet_desc_t descriptor = s_opus_descriptors[s_opus_read_desc];
+    if (descriptor.length > capacity) {
+        opus_ring_discard_oldest_locked();
+        xSemaphoreGive(s_opus_mutex);
+        return false;
+    }
+    opus_ring_copy(s_opus_ring, descriptor.offset, data, descriptor.length, false);
+    *length = descriptor.length;
+    *turn = descriptor.turn;
+    *sequence = descriptor.seq;
+    s_opus_used_bytes -= descriptor.length;
+    s_opus_read_desc = (s_opus_read_desc + 1U) % OPUS_RING_DESCRIPTOR_COUNT;
+    s_opus_desc_count--;
+    xSemaphoreGive(s_opus_mutex);
+    return true;
+}
+
+/**
+ * @brief 清空 Opus 环形缓冲区和帧描述符。
+ */
+static void opus_ring_clear(void)
+{
+    if (s_opus_mutex == NULL || xSemaphoreTake(s_opus_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    s_opus_write_offset = 0;
+    s_opus_used_bytes = 0;
+    s_opus_write_desc = 0;
+    s_opus_read_desc = 0;
+    s_opus_desc_count = 0;
+    xSemaphoreGive(s_opus_mutex);
+}
+
+#if CONFIG_AI_DIALOG_VERBOSE_STATS
+/**
+ * @brief 读取统计用的 Opus 缓冲区当前占用字节数。
+ */
+static size_t opus_ring_get_used_bytes(void)
+{
+    size_t used = 0;
+    if (s_opus_mutex != NULL && xSemaphoreTake(s_opus_mutex, 0) == pdTRUE) {
+        used = s_opus_used_bytes;
+        xSemaphoreGive(s_opus_mutex);
+    }
+    return used;
+}
+
+/**
+ * @brief 读取统计用的 Opus 待解码帧数量。
+ */
+static size_t opus_ring_get_packet_count(void)
+{
+    size_t count = 0;
+    if (s_opus_mutex != NULL && xSemaphoreTake(s_opus_mutex, 0) == pdTRUE) {
+        count = s_opus_desc_count;
+        xSemaphoreGive(s_opus_mutex);
+    }
+    return count;
+}
+#endif
+
+/**
+ * @brief 初始化 200 KB PSRAM Opus 环形缓冲区。
+ */
+static esp_err_t opus_ring_init(void)
+{
+    s_opus_ring = heap_caps_malloc(
+        OPUS_RING_BUFFER_BYTES,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    );
+    s_opus_descriptors = heap_caps_calloc(
+        OPUS_RING_DESCRIPTOR_COUNT,
+        sizeof(opus_packet_desc_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    );
+    if (s_opus_ring == NULL || s_opus_descriptors == NULL) {
+        free(s_opus_ring);
+        free(s_opus_descriptors);
+        s_opus_ring = NULL;
+        s_opus_descriptors = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    opus_ring_clear();
+    ESP_LOGI(TAG, "下行 Opus PSRAM 缓冲区已创建：%u 字节，描述符：%u 帧",
+             (unsigned)OPUS_RING_BUFFER_BYTES,
+             (unsigned)OPUS_RING_DESCRIPTOR_COUNT);
+    return ESP_OK;
+}
+
+/**
+ * @brief 释放 Opus 环形缓冲区资源。
+ */
+static void opus_ring_deinit(void)
+{
+    free(s_opus_ring);
+    free(s_opus_descriptors);
+    s_opus_ring = NULL;
+    s_opus_descriptors = NULL;
+}
+
 static void clear_pcm(void)
 {
     pcm_t p;
@@ -119,7 +361,12 @@ static void finish(const char *reason, bool notify, bool restore)
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
     xSemaphoreTake(s_pcm_mutex, portMAX_DELAY);
     xSemaphoreTake(s_output_mutex, portMAX_DELAY);
-    coze_app_stop(); clear_packets(s_audio_queue); clear_pcm();
+    coze_app_stop();
+    opus_ring_clear();
+    clear_pcm();
+    if (s_decoder != NULL) {
+        (void)esp_opus_dec_reset(s_decoder);
+    }
     (void)audio_service_set_output_enabled(
         AUDIO_SERVICE_OWNER_AI_DIALOG,
         false
@@ -128,7 +375,6 @@ static void finish(const char *reason, bool notify, bool restore)
     atomic_store(&s_failure, 0);
     wake_word_stop_conversation(); atomic_store(&s_end_seen, false);
     atomic_store(&s_restore_pending, restore);
-    coze_app_stop();
     ESP_LOGI(TAG, "turn=%u session ended: %s", atomic_load(&s_turn), reason);
 }
 /*
@@ -149,6 +395,7 @@ static bool open_codecs(const coze_app_audio_config_t *audio_config)
         return false;
     }
     if (s_encoder) { esp_opus_enc_close(s_encoder); s_encoder = NULL; }
+    if (s_decoder) { (void)esp_opus_dec_close(s_decoder); s_decoder = NULL; }
     s_input_opus = audio_config->input_opus;
     if (s_input_opus) {
         esp_opus_enc_config_t cfg = ESP_OPUS_ENC_CONFIG_DEFAULT();
@@ -159,10 +406,41 @@ static bool open_codecs(const coze_app_audio_config_t *audio_config)
         cfg.application_mode = ESP_OPUS_ENC_APPLICATION_VOIP; cfg.complexity = 5; cfg.enable_vbr = true;
         if (esp_opus_enc_open(&cfg, sizeof(cfg), &s_encoder) != ESP_AUDIO_ERR_OK) return false;
         int in = 0, out = 0;
-        if (esp_opus_enc_get_frame_size(s_encoder, &in, &out) != ESP_AUDIO_ERR_OK || in != FRAME_SAMPLES * sizeof(int16_t) || out > MAX_PACKET) return false;
+        if (esp_opus_enc_get_frame_size(s_encoder, &in, &out) != ESP_AUDIO_ERR_OK ||
+            in != FRAME_SAMPLES * sizeof(int16_t) || out > MAX_PACKET) {
+            esp_opus_enc_close(s_encoder);
+            s_encoder = NULL;
+            return false;
+        }
     }
-    /* Coze audio_callback 已经完成下行 Opus 解码，播放队列直接接收 PCM。 */
-    if (audio_config->output_opus) return false;
+
+    /* 下行线路使用 Opus，解码器固定输出 16 kHz、单声道 PCM 给扬声器。 */
+    if (!audio_config->output_opus || audio_config->output_sample_rate != 16000U ||
+        audio_config->output_channels != 1U || audio_config->output_bits_per_sample != 16U ||
+        audio_config->output_frame_us != 20000U) {
+        if (s_encoder != NULL) {
+            esp_opus_enc_close(s_encoder);
+            s_encoder = NULL;
+        }
+        return false;
+    }
+    esp_opus_dec_cfg_t decoder_config = ESP_OPUS_DEC_CONFIG_DEFAULT();
+    decoder_config.sample_rate = audio_config->output_sample_rate;
+    decoder_config.channel = audio_config->output_channels;
+    decoder_config.frame_duration = ESP_OPUS_DEC_FRAME_DURATION_20_MS;
+    decoder_config.self_delimited = false;
+    if (esp_opus_dec_open(
+            &decoder_config,
+            sizeof(decoder_config),
+            &s_decoder
+        ) != ESP_AUDIO_ERR_OK) {
+        s_decoder = NULL;
+        if (s_encoder != NULL) {
+            esp_opus_enc_close(s_encoder);
+            s_encoder = NULL;
+        }
+        return false;
+    }
     return true;
 }
 static bool begin_turn(void)
@@ -238,28 +516,18 @@ static void on_coze_event(const coze_app_event_t *event, void *context)
             atomic_fetch_add(&s_rx_drops, 1);
             return;
         }
-
-        packet_t packet = {
-            .length = event->length,
-            .data = malloc(event->length),
-            .turn = event->turn,
-            .seq = event->sequence,
-        };
-        if (packet.data == NULL) {
+        unsigned evicted_count = 0;
+        if (!opus_ring_push(
+                event->data,
+                event->length,
+                event->turn,
+                event->sequence,
+                &evicted_count
+            )) {
             atomic_fetch_add(&s_rx_drops, 1);
-            return;
-        }
-        memcpy(packet.data, event->data, event->length);
-        if (xQueueSend(s_audio_queue, &packet, 0) != pdTRUE) {
-            packet_t discarded;
-            if (xQueueReceive(s_audio_queue, &discarded, 0) == pdTRUE) {
-                free(discarded.data);
-                atomic_fetch_add(&s_rx_drops, 1);
-            }
-            if (xQueueSend(s_audio_queue, &packet, 0) != pdTRUE) {
-                free(packet.data);
-                atomic_fetch_add(&s_rx_drops, 1);
-            }
+        } else if (evicted_count != 0) {
+            /* 200 KB 已满时只淘汰最旧完整帧，统计被淘汰的帧数量。 */
+            atomic_fetch_add(&s_rx_drops, evicted_count);
         }
         return;
     }
@@ -367,44 +635,143 @@ static void ai_dialog_encode_worker(void *arg)
         xSemaphoreGive(s_encoder_mutex);
     }
 }
-/* Cancellation-aware bounded PCM queue. A zero-length marker retires a corrupt
- * packet in order, so one decoder failure cannot deadlock playback credit. */
+/**
+ * @brief 把一个完整 Opus 帧解码成 PCM。
+ *
+ * Coze 的每个 audio delta 都是一个独立 Opus 帧。解码器使用固定的 20 ms、
+ * 16 kHz、单声道配置；输入缓冲区不会被覆盖，输出缓冲区由调用方提供。
+ */
+static bool decode_opus_frame(
+    const uint8_t *encoded,
+    size_t encoded_length,
+    uint8_t *pcm,
+    size_t pcm_capacity,
+    size_t *pcm_length
+)
+{
+    if (s_decoder == NULL || encoded == NULL || encoded_length == 0 ||
+        encoded_length > UINT32_MAX || pcm == NULL || pcm_length == NULL) {
+        return false;
+    }
+
+    esp_audio_dec_in_raw_t raw = {
+        .buffer = (uint8_t *)encoded,
+        .len = (uint32_t)encoded_length,
+        .consumed = 0,
+        .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+    };
+    esp_audio_dec_out_frame_t output = {
+        .buffer = pcm,
+        .len = (uint32_t)pcm_capacity,
+        .needed_size = 0,
+        .decoded_size = 0,
+    };
+    esp_audio_dec_info_t info = {0};
+    size_t total_decoded = 0;
+
+    while (raw.len > 0) {
+        if (total_decoded >= pcm_capacity) {
+            return false;
+        }
+        output.buffer = pcm + total_decoded;
+        output.len = (uint32_t)(pcm_capacity - total_decoded);
+        output.needed_size = 0;
+        output.decoded_size = 0;
+        esp_audio_err_t error = esp_opus_dec_decode(s_decoder, &raw, &output, &info);
+        if (error != ESP_AUDIO_ERR_OK || output.decoded_size > pcm_capacity - total_decoded ||
+            raw.consumed == 0 || raw.consumed > raw.len) {
+            return false;
+        }
+        total_decoded += output.decoded_size;
+        raw.buffer += raw.consumed;
+        raw.len -= raw.consumed;
+        raw.consumed = 0;
+    }
+
+    *pcm_length = total_decoded;
+    return total_decoded != 0;
+}
+
+/**
+ * @brief 把解码后的 PCM 送入有界播放队列。
+ *
+ * 播放任务按 I2S 实际速度消费该队列；当队列短暂满时，解码任务等待，
+ * 让 200 KB Opus 缓冲区承担网络突发，避免在 WebSocket 回调中阻塞。
+ */
 static void enqueue_pcm(pcm_t *pcm)
 {
     while (current(pcm->generation, pcm->turn) && playing()) if (xQueueSend(s_pcm_queue, pcm, pdMS_TO_TICKS(20)) == pdTRUE) return;
     free(pcm->data);
 }
+
+/**
+ * @brief 独立的 Opus 解码任务。
+ *
+ * 该任务从 PSRAM 环形缓冲区按完整帧取数据，使用 ESP Audio Codec 的 Opus
+ * 解码器生成 PCM，再把 PCM 交给现有扬声器播放任务。解码不在 Coze 回调中
+ * 执行，因此网络接收和音频播放彼此不会直接阻塞。
+ */
 static void ai_dialog_decode_worker(void *arg)
 {
     (void)arg;
+    _Alignas(16) uint8_t opus_frame[MAX_PACKET];
+    _Alignas(16) uint8_t pcm_buffer[MAX_PCM_BYTES];
     for (;;) {
         xSemaphoreTake(s_pcm_mutex, portMAX_DELAY);
         bool processed = false;
-        packet_t p;
-        if (playing() && xQueueReceive(s_audio_queue, &p, 0) == pdTRUE) {
+        size_t opus_length = 0;
+        unsigned turn = 0;
+        unsigned sequence = 0;
+        if (playing() && opus_ring_pop(
+                opus_frame,
+                sizeof(opus_frame),
+                &opus_length,
+                &turn,
+                &sequence
+            )) {
             processed = true;
             unsigned gen = atomic_load(&s_generation);
-            pcm_t pcm = { .generation = gen, .turn = p.turn, .seq = p.seq };
-            if (current(gen, p.turn)) {
-                pcm.data = heap_caps_malloc(MAX_PCM_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                bool ok = pcm.data != NULL;
-                /* Coze 的 audio_callback 已经给出解码后的 PCM，直接复制到
-                 * 播放队列，禁止在这里再次运行 Opus 解码器。 */
-                ok = p.length <= MAX_PCM_BYTES && p.length % 2 == 0;
-                if (ok) { memcpy(pcm.data, p.data, p.length); pcm.length = p.length; }
-                if (!ok) {
-                    atomic_fetch_add(&s_decode_drops, 1); free(pcm.data); pcm.data = NULL; pcm.length = 0;
-                    ESP_LOGW(TAG, "turn=%u PCM dropped seq=%u bytes=%u", p.turn, p.seq, (unsigned)p.length);
-                } else atomic_fetch_add(&s_decoded, 1);
-                enqueue_pcm(&pcm);
+            if (current(gen, turn)) {
+                size_t pcm_length = 0;
+                if (!decode_opus_frame(
+                        opus_frame,
+                        opus_length,
+                        pcm_buffer,
+                        sizeof(pcm_buffer),
+                        &pcm_length
+                    ) || pcm_length % sizeof(int16_t) != 0) {
+                    atomic_fetch_add(&s_decode_drops, 1);
+                    ESP_LOGW(TAG, "turn=%u Opus 解码失败 seq=%u bytes=%u",
+                             turn, sequence, (unsigned)opus_length);
+                } else {
+                    pcm_t pcm = {
+                        .length = pcm_length,
+                        .data = heap_caps_malloc(
+                            pcm_length,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+                        ),
+                        .generation = gen,
+                        .turn = turn,
+                        .seq = sequence,
+                    };
+                    if (pcm.data == NULL) {
+                        atomic_fetch_add(&s_decode_drops, 1);
+                        ESP_LOGW(TAG, "turn=%u PCM PSRAM 分配失败 seq=%u bytes=%u",
+                                 turn, sequence, (unsigned)pcm_length);
+                    } else {
+                        memcpy(pcm.data, pcm_buffer, pcm_length);
+                        atomic_fetch_add(&s_decoded, 1);
+                        enqueue_pcm(&pcm);
+                    }
+                }
             }
-            free(p.data);
             atomic_store(&s_pcm_stack_free, uxTaskGetStackHighWaterMark(NULL));
         }
         xSemaphoreGive(s_pcm_mutex);
-        /* A sub-tick delay rounds to zero at 100Hz and can starve idle/encoder.
-         * Sleep a real tick only when idle, preserving short Opus frame rates. */
-        if (!processed) vTaskDelay(1);
+        if (!processed) {
+            /* 没有待解码帧时睡眠；收到新帧后由回调释放信号立即唤醒。 */
+            (void)xSemaphoreTake(s_opus_data_sem, pdMS_TO_TICKS(20));
+        }
     }
 }
 static void ai_dialog_output_worker(void *arg)
@@ -446,14 +813,22 @@ static void ai_dialog_output_worker(void *arg)
         if (!processed) vTaskDelay(1);
     }
 }
-/* Empty compressed queue is NOT playback completion: check decoder, PCM,
- * in-flight writer and final DMA tail while holding both pipeline locks. */
+/*
+ * 音频结束事件不等于已经播放完成：必须同时确认 Opus 环形缓冲区、PCM 队列、
+ * 解码任务和 I2S DMA 尾部都已经排空，才能切回待机监听。
+ */
 static void try_drain(void)
 {
     if (!playing() || !atomic_load(&s_end_seen)) return;
     if (xSemaphoreTake(s_pcm_mutex, 0) != pdTRUE) return;
     if (xSemaphoreTake(s_output_mutex, 0) != pdTRUE) { xSemaphoreGive(s_pcm_mutex); return; }
-    bool drained = !uxQueueMessagesWaiting(s_audio_queue) && !uxQueueMessagesWaiting(s_pcm_queue);
+    if (xSemaphoreTake(s_opus_mutex, 0) != pdTRUE) {
+        xSemaphoreGive(s_output_mutex);
+        xSemaphoreGive(s_pcm_mutex);
+        return;
+    }
+    bool drained = s_opus_desc_count == 0 && !uxQueueMessagesWaiting(s_pcm_queue);
+    xSemaphoreGive(s_opus_mutex);
     esp_err_t error = ESP_OK;
     if (drained) {
         error = audio_service_drain(AUDIO_SERVICE_OWNER_AI_DIALOG);
@@ -531,16 +906,18 @@ static void ai_dialog_worker(void *arg)
             if (err == ESP_OK) atomic_store(&s_restore_pending, false);
             else if (err != ESP_ERR_INVALID_STATE) ESP_LOGW(TAG, "Capture restore retry: %s", esp_err_to_name(err));
         }
-        int64_t now = now_ms();
 #if CONFIG_AI_DIALOG_VERBOSE_STATS
+        int64_t now = now_ms();
         if (now - rate_at >= 5000) {
             unsigned samples = atomic_exchange(&s_produced_samples, 0), enc = atomic_exchange(&s_encoded, 0);
             unsigned bytes = atomic_exchange(&s_tx_bytes, 0), dec = atomic_exchange(&s_decoded, 0), written = atomic_exchange(&s_written, 0);
             double seconds = (double)(now - rate_at) / 1000.0;
-            ESP_LOGI(TAG, "audio %lldms PCM=%u samples %.2fKiB/s encoded=%u %.2ffps/%u bytes %.2fKiB/s decoded=%u written=%u; drops capture=%u encode/TX=%u RX=%u decode=%u write=%u; queues enc=%u/16 opus=%u/96 pcm=%u/4; encoder stack free=%u",
+            ESP_LOGI(TAG, "audio %lldms PCM=%u samples %.2fKiB/s encoded=%u %.2ffps/%u bytes %.2fKiB/s decoded=%u written=%u; drops capture=%u encode/TX=%u RX=%u decode=%u write=%u; queues enc=%u/16 opus_packets=%u opus_bytes=%u/%u pcm=%u/4; encoder stack free=%u",
                 now - rate_at, samples, samples * 2 / seconds / 1024, enc, enc / seconds, bytes, bytes / seconds / 1024, dec, written,
                 atomic_exchange(&s_capture_drops, 0), atomic_exchange(&s_encode_drops, 0), atomic_exchange(&s_rx_drops, 0), atomic_exchange(&s_decode_drops, 0), atomic_exchange(&s_write_drops, 0),
-                (unsigned)uxQueueMessagesWaiting(s_encode_queue), (unsigned)uxQueueMessagesWaiting(s_audio_queue), (unsigned)uxQueueMessagesWaiting(s_pcm_queue), atomic_load(&s_encoder_stack_free));
+                (unsigned)uxQueueMessagesWaiting(s_encode_queue), (unsigned)opus_ring_get_packet_count(),
+                (unsigned)opus_ring_get_used_bytes(), (unsigned)OPUS_RING_BUFFER_BYTES,
+                (unsigned)uxQueueMessagesWaiting(s_pcm_queue), atomic_load(&s_encoder_stack_free));
             rate_at = now;
             ESP_LOGI(TAG, "stack free encoder=%u/32768 decoder=%u/24576 output=%u/6144 control=%u/8192 bytes",
                 atomic_load(&s_encoder_stack_free), atomic_load(&s_pcm_stack_free), atomic_load(&s_output_stack_free),
@@ -554,14 +931,17 @@ esp_err_t ai_dialog_init(void)
 {
     if (atomic_load(&s_initialized)) return ESP_ERR_INVALID_STATE;
     if (ai_dialog_logic_init() != ESP_OK) return ESP_FAIL;
-    s_control_queue = xQueueCreate(CONTROL_QUEUE_LENGTH, sizeof(packet_t)); s_audio_queue = xQueueCreate(AUDIO_QUEUE_LENGTH, sizeof(packet_t));
+    s_control_queue = xQueueCreate(CONTROL_QUEUE_LENGTH, sizeof(packet_t));
     s_encode_queue = xQueueCreateWithCaps(ENCODE_QUEUE_LENGTH, sizeof(capture_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_pcm_queue = xQueueCreate(PCM_QUEUE_LENGTH, sizeof(pcm_t));
     s_control_mutex = xSemaphoreCreateMutex(); s_capture_mutex = xSemaphoreCreateMutex();
     s_encoder_mutex = xSemaphoreCreateMutex(); s_pcm_mutex = xSemaphoreCreateMutex(); s_output_mutex = xSemaphoreCreateMutex();
+    s_opus_mutex = xSemaphoreCreateMutex(); s_opus_data_sem = xSemaphoreCreateBinary();
     s_vad = vad_create((vad_mode_t)CONFIG_AI_DIALOG_VAD_MODE);
     TaskHandle_t tasks[4] = {0};
-    if (!s_control_queue || !s_audio_queue || !s_encode_queue || !s_pcm_queue || !s_control_mutex || !s_capture_mutex || !s_encoder_mutex || !s_pcm_mutex || !s_output_mutex || !s_vad) goto fail;
+    if (!s_control_queue || !s_encode_queue || !s_pcm_queue || !s_control_mutex || !s_capture_mutex ||
+        !s_encoder_mutex || !s_pcm_mutex || !s_output_mutex || !s_opus_mutex || !s_opus_data_sem || !s_vad ||
+        opus_ring_init() != ESP_OK) goto fail;
     coze_app_config_t coze_config = {
         .on_event = on_coze_event,
         .context = NULL,
@@ -587,12 +967,15 @@ esp_err_t ai_dialog_init(void)
     atomic_store(&s_initialized, true); return ESP_OK;
 fail:
     for (unsigned i = 0; i < 4; ++i) if (tasks[i]) vTaskDelete(tasks[i]);
+    if (s_decoder) { (void)esp_opus_dec_close(s_decoder); s_decoder = NULL; }
+    if (s_encoder) { esp_opus_enc_close(s_encoder); s_encoder = NULL; }
     if (s_vad) vad_destroy(s_vad);
-    QueueHandle_t queues[] = {s_control_queue, s_audio_queue, s_pcm_queue};
-    for (unsigned i = 0; i < 3; ++i) if (queues[i]) vQueueDelete(queues[i]);
+    opus_ring_deinit();
+    QueueHandle_t queues[] = {s_control_queue, s_pcm_queue};
+    for (unsigned i = 0; i < 2; ++i) if (queues[i]) vQueueDelete(queues[i]);
     if (s_encode_queue) vQueueDeleteWithCaps(s_encode_queue);
-    SemaphoreHandle_t locks[] = {s_control_mutex, s_capture_mutex, s_encoder_mutex, s_pcm_mutex, s_output_mutex};
-    for (unsigned i = 0; i < 5; ++i) if (locks[i]) vSemaphoreDelete(locks[i]);
+    SemaphoreHandle_t locks[] = {s_control_mutex, s_capture_mutex, s_encoder_mutex, s_pcm_mutex, s_output_mutex, s_opus_mutex, s_opus_data_sem};
+    for (unsigned i = 0; i < 7; ++i) if (locks[i]) vSemaphoreDelete(locks[i]);
     return ESP_ERR_NO_MEM;
 }
 void ai_dialog_on_wake_detected(void)

@@ -53,7 +53,7 @@ typedef struct {
  * @brief AI 对话层使用的统一 PCM/Opus 格式说明。
  *
  * 当前上行字段表示送往 Coze 的 Opus 编码格式；下行字段表示 SDK 回调
- * 交给应用层的 PCM 格式，而不是线路上的 Opus 格式。
+ * 交给应用层的线路编码格式。下行使用 Opus 时，应用层必须先解码为 PCM。
  */
 typedef struct {
     bool input_opus;

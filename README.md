@@ -16,8 +16,9 @@ main/app_main.c
 ```
 
 音频格式固定为 16 kHz、单声道、16 bit；上行使用 60 ms Opus，下行线路使用
-20 ms Opus，Coze SDK 的 `audio_callback` 已经返回解码 PCM，播放链路不再重复解码。
-ES8311 扬声器音量配置为 100，Coze 下行每秒最多 50 个 20 ms 音频帧。
+20 ms Opus。Coze SDK 的 `audio_callback` 只完成 Base64 解码，应用层把 Opus
+帧放入 200 KB PSRAM 环形缓冲区，再由独立任务实时解码为 PCM 后播放。ES8311
+扬声器音量配置为 100，Coze 下行每秒最多 50 个 20 ms 音频帧。
 
 ## 目录职责
 
