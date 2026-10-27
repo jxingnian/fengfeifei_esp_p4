@@ -1,0 +1,5 @@
+version: "0.1.0"
+description: "Coze realtime direct AI application"
+dependencies:
+  idf: ">=6.0"
+  espressif/esp_coze: ^1.0.0

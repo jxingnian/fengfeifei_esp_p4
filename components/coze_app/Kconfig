@@ -1,0 +1,57 @@
+﻿menu "Coze 直连 AI 应用"
+
+    config COZE_APP_BOT_ID
+        string "Coze Bot ID"
+        default "7699765325453639731"
+        help
+            Coze 应用的 Bot ID。
+
+    config COZE_APP_ACCESS_TOKEN
+        string "Coze access token"
+        default ""
+        help
+            Coze PAT、OAuth 或 JWT bearer token。正式值写入本地 sdkconfig，
+            不要把访问令牌写入业务源码或提交到版本库。
+
+    config COZE_APP_USER_ID
+        string "Coze user ID"
+        default "p4c5-device"
+        help
+            用于保持 Coze 会话身份稳定的设备用户 ID。
+
+    config AI_DIALOG_VERBOSE_STATS
+        bool "Enable periodic audio pipeline statistics"
+        default n
+
+    config AI_DIALOG_VAD_MODE
+        int "WebRTC VAD aggressiveness"
+        range 0 4
+        default 3
+
+    config AUDIO_DRIVER_SPEAKER_VOLUME
+        int "ES8311 speaker volume (0-100)"
+        range 0 100
+        default 100
+
+    config AI_DIALOG_TAIL_SILENCE_MS
+        int "End a turn after silence (ms)"
+        range 400 2000
+        default 800
+
+    config AI_DIALOG_NO_SPEECH_MS
+        int "Exit listening when no speech starts (ms)"
+        range 3000 15000
+        default 5000
+
+    config AI_DIALOG_MAX_TURN_MS
+        int "Maximum speech turn (ms)"
+        range 5000 30000
+        default 15000
+
+    config AI_DIALOG_REPLY_TIMEOUT_MS
+        int "First audio timeout after commit (ms)"
+        range 5000 60000
+        default 10000
+
+endmenu
+

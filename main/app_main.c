@@ -1,16 +1,15 @@
 /*
  * @file app_main.c
- * @brief ESP32-P4 主业务入口。
+ * @brief 当前阶段设备固件启动入口。
  *
- * 启动顺序固定为：初始化 NVS、启动 P4/C5 Wi-Fi 配网组件、初始化并启动
- * “你好小飞”语音唤醒组件。Wi-Fi 联网状态机异步运行，因此语音服务不等待
- * STA 联网成功即可开始监听。
+ * 设备目前只启用 Wi-Fi 配网、统一音频服务、Coze 直连 AI 对话和本地
+ * 唤醒词。视频通话、后台网关以及小程序链路不在本固件启动图中，后续
+ * 接入新业务时应作为独立组件注册到系统状态机，而不是重新塞入本文件。
  */
 #include "p4_c5_wifi.h"
-#include "voice_service.h"
-#include "voice_ai_service.h"
-#include "cloud_gateway.h"
-#include "call_service.h"
+#include "audio_service.h"
+#include "ai_dialog.h"
+#include "wake_word.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -18,44 +17,17 @@
 
 static const char *TAG = "app_main";
 
-static esp_err_t send_call_media(bool binary, const void *data, size_t length)
-{
-    return cloud_gateway_send(binary, data, length);
-}
-
-static void on_cloud_message(bool binary, const void *data, size_t length, void *context)
-{
-    (void)context;
-    /*
-     * AI 服务先复制并排队后台消息，通话服务再处理通话控制和通话 PCM。
-     * 两个服务各自判断当前状态，AI 音频不会被通话服务错误地当作通话音频播放。
-     */
-    voice_ai_service_on_cloud_message(binary, data, length);
-    call_service_on_cloud_message(binary, data, length);
-}
-
 /**
- * @brief 把统一麦克风采集任务输出的 PCM 交给 AI 会话服务。
+ * @brief 初始化 NVS。
  *
- * 该回调只负责快速转发；采集任务、网络发送任务和播放任务各自独立运行，
- * 不在这里等待后台响应，避免网络抖动阻塞本地唤醒识别。
+ * Wi-Fi 配网组件和 ESP-Hosted 参数都依赖 NVS；遇到旧版本或空间不足时
+ * 按 ESP-IDF 约定擦除后重新初始化，保证设备可以从干净状态启动。
  */
-static void on_voice_pcm(const int16_t *samples, size_t sample_count, void *context)
-{
-    (void)context;
-    voice_ai_service_on_pcm(samples, sample_count, NULL);
-}
-
-/**
- * @brief 初始化保存 Wi-Fi 配置和系统参数所需的 NVS 分区。
- *
- * 当分区来自旧版本 ESP-IDF 或没有可用页时，按照 ESP-IDF 官方流程擦除后
- * 重新初始化，确保 P4 主程序和 C5 远程 Wi-Fi 驱动可以正常保存参数。
- */
-static void initialize_nvs(void)
+static void app_initialize_nvs(void)
 {
     esp_err_t error = nvs_flash_init();
-    if (error == ESP_ERR_NVS_NO_FREE_PAGES || error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (error == ESP_ERR_NVS_NO_FREE_PAGES ||
+        error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         error = nvs_flash_init();
     }
@@ -63,13 +35,13 @@ static void initialize_nvs(void)
 }
 
 /**
- * @brief 处理语音组件事件。
+ * @brief 处理唤醒词服务事件。
  *
- * 当前阶段记录“你好小飞”唤醒结果。后续 AI 对话、音乐、灯光和网页配网
- * 业务通过此处把事件投递到业务队列，不能在语音回调中执行耗时操作。
+ * 回调只做状态日志和快速投递。AI 网络连接、编解码和播放全部在 ai_dialog
+ * 自己的任务中执行，避免 Wi-Fi 或串口日志阻塞麦克风采集任务。
  */
-static void on_voice_service_event(
-    const voice_service_event_t *event,
+static void app_on_wake_word_event(
+    const wake_word_event_t *event,
     void *user_context
 )
 {
@@ -79,22 +51,22 @@ static void on_voice_service_event(
     }
 
     switch (event->type) {
-    case VOICE_SERVICE_EVENT_READY:
-        ESP_LOGI(TAG, "语音服务初始化完成，唤醒词：你好小飞");
+    case WAKE_WORD_EVENT_READY:
+        ESP_LOGI(TAG, "唤醒词服务就绪：你好小飞");
         break;
-    case VOICE_SERVICE_EVENT_WAKE_DETECTED:
-        ESP_LOGI(TAG, "业务层收到唤醒事件：你好小飞，概率：%.3f", event->probability);
-        voice_ai_service_on_wake_detected();
+    case WAKE_WORD_EVENT_WAKE_DETECTED:
+        ESP_LOGI(TAG, "收到唤醒词事件，概率：%.3f", event->probability);
+        ai_dialog_on_wake_detected();
         break;
-    case VOICE_SERVICE_EVENT_AUDIO_ERROR:
-    case VOICE_SERVICE_EVENT_MODEL_ERROR:
-        ESP_LOGE(TAG, "语音服务错误：%s", esp_err_to_name(event->error));
+    case WAKE_WORD_EVENT_AUDIO_ERROR:
+    case WAKE_WORD_EVENT_MODEL_ERROR:
+        ESP_LOGE(TAG, "唤醒词服务错误：%s", esp_err_to_name(event->error));
         break;
-    case VOICE_SERVICE_EVENT_TIMEOUT:
-        ESP_LOGD(TAG, "一次语音识别窗口结束，继续监听你好小飞");
+    case WAKE_WORD_EVENT_TIMEOUT:
+        ESP_LOGD(TAG, "本次唤醒识别窗口结束，继续监听");
         break;
-    case VOICE_SERVICE_EVENT_STOPPED:
-        ESP_LOGI(TAG, "语音监听已停止");
+    case WAKE_WORD_EVENT_STOPPED:
+        ESP_LOGI(TAG, "唤醒词采集任务已停止");
         break;
     default:
         break;
@@ -102,50 +74,53 @@ static void on_voice_service_event(
 }
 
 /**
- * @brief P4 应用入口。
+ * @brief 把统一音频服务输出的麦克风 PCM 投递给 AI 对话层。
+ *
+ * 该回调运行在唤醒词采集任务中，只允许非阻塞投递；音频编码和网络发送
+ * 由 ai_dialog 的独立任务完成。
+ */
+static void app_on_capture_pcm(
+    const int16_t *samples,
+    size_t sample_count,
+    void *user_context
+)
+{
+    (void)user_context;
+    ai_dialog_on_pcm(samples, sample_count, NULL);
+}
+
+/**
+ * @brief P4 主应用入口。
  */
 void app_main(void)
 {
-    initialize_nvs();
-    ESP_ERROR_CHECK(cloud_gateway_web_register());
+    app_initialize_nvs();
 
     esp_err_t error = p4_c5_wifi_start();
-    if (error == ESP_OK) {
-        ESP_LOGI(TAG, "P4/C5 Wi-Fi 配网组件已启动");
-    } else {
-        ESP_LOGE(TAG, "P4/C5 Wi-Fi 配网组件初始化失败：%s", esp_err_to_name(error));
-    }
-
-    ESP_ERROR_CHECK(voice_service_register_callback(on_voice_service_event, NULL));
-    ESP_ERROR_CHECK(voice_ai_service_init());
-    ESP_ERROR_CHECK(voice_service_register_pcm_callback(on_voice_pcm, NULL));
-
-    error = voice_service_init();
     if (error != ESP_OK) {
-        ESP_LOGE(TAG, "语音服务初始化失败：%s", esp_err_to_name(error));
+        ESP_LOGE(TAG, "Wi-Fi 配网服务启动失败：%s", esp_err_to_name(error));
+        return;
+    }
+    ESP_LOGI(TAG, "Wi-Fi 配网服务已启动");
+
+    /* 统一音频服务必须早于唤醒词和 AI 对话初始化，确保两者共享同一套
+     * ES8311/I2S 资源，并让音量配置在启动阶段一次性写入硬件。 */
+    ESP_ERROR_CHECK(audio_service_init());
+    ESP_ERROR_CHECK(wake_word_register_callback(app_on_wake_word_event, NULL));
+    ESP_ERROR_CHECK(wake_word_register_pcm_callback(app_on_capture_pcm, NULL));
+    ESP_ERROR_CHECK(ai_dialog_init());
+
+    error = wake_word_init();
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "唤醒词服务初始化失败：%s", esp_err_to_name(error));
         return;
     }
 
-#ifdef CONFIG_VOICE_AI_SELF_TEST
-    ESP_ERROR_CHECK(voice_ai_service_audio_self_test());
-#endif
-
-    /* Initialize the call queue/camera before accepting cloud messages, and
-     * before the voice task begins using the shared codec/I2C resources. */
-    error = call_service_init(send_call_media);
+    error = wake_word_start();
     if (error != ESP_OK) {
-        ESP_LOGE(TAG, "通话服务启动失败：%s", esp_err_to_name(error));
+        ESP_LOGE(TAG, "唤醒词监听启动失败：%s", esp_err_to_name(error));
         return;
     }
 
-    error = voice_service_start();
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "语音监听启动失败：%s", esp_err_to_name(error));
-        return;
-    }
-
-    cloud_gateway_config_t gateway_config = { .on_message = on_cloud_message, .context = NULL };
-    error = cloud_gateway_start(&gateway_config);
-    if (error != ESP_OK) ESP_LOGE(TAG, "Cloud gateway startup failed: %s", esp_err_to_name(error));
-    ESP_LOGI(TAG, "系统启动完成，当前唤醒词为：你好小飞");
+    ESP_LOGI(TAG, "系统启动完成：待机监听 -> Coze 直连 AI 对话");
 }

@@ -66,7 +66,6 @@ static const char s_index_html[] =
     "<div id='message' class='message'></div><div id='scanList'></div></div>"
     "<div class='card'><h2>已保存 Wi-Fi</h2><div id='savedList' class='tip'>读取中</div></div>"
     "<div class='tip'>设备始终保持 AP+STA 模式。开机或断网后会按列表顺序轮询，每个 Wi-Fi 最多尝试 3 次；全部失败后保持热点和本页面继续配网。</div>"
-    "<iframe title='后台连接与配对' src='/cloud' style='width:100%;height:680px;border:0;margin-top:16px' loading='eager'></iframe>"
     "</div><script>"
     "const stateText={0:'已停止',1:'启动中',2:'正在连接',3:'已联网',4:'等待配网'};"
     "async function getJson(url,opt){const r=await fetch(url,opt);const j=await r.json();if(!r.ok)throw new Error(j.message||'请求失败');return j;}"

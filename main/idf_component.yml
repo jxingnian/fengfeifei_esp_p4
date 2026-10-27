@@ -9,4 +9,3 @@ dependencies:
     - if: target in [esp32p4, esp32h2]
   idf:
     version: '>=6.0'
-  espressif/esp_coze: ^1.0.0

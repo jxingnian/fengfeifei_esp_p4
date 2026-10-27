@@ -1,0 +1,18 @@
+menu "板级音频驱动"
+
+    config WAKE_WORD_MIC_GAIN_DB
+        int "ES8311 麦克风增益（dB）"
+        default 24
+        range 0 42
+        help
+            ES8311 ADC 麦克风输入增益。该参数属于板级音频驱动，供唤醒词
+            和 AI 对话共享同一套麦克风增益配置。
+
+    config AUDIO_DRIVER_SPEAKER_VOLUME
+        int "ES8311 扬声器音量（0-100）"
+        range 0 100
+        default 100
+        help
+            设备启动时写入 ES8311 DAC 的输出音量，当前产品要求设置为最大值。
+
+endmenu

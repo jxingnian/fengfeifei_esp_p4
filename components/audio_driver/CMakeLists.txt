@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "audio_driver.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_codec_dev
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
+)

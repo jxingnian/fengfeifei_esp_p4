@@ -1,0 +1,23 @@
+menu "唤醒词服务"
+
+    config WAKE_WORD_ENABLED
+        bool "启用语音唤醒服务"
+        default y
+        help
+            启用 ESP32-P4 上的 ES8311 麦克风和中文 MultiNet 语音唤醒服务。
+
+    config WAKE_WORD_MN_THRESHOLD
+        float "MultiNet 唤醒阈值"
+        default 0.60
+        range 0.10 0.99
+        help
+            “你好小飞”命令词的识别阈值。数值越高误唤醒越少，但需要更清晰地说出命令词。
+
+    config WAKE_WORD_COMMAND_TIMEOUT_MS
+        int "命令识别超时时间（毫秒）"
+        default 6000
+        range 1000 30000
+        help
+            MultiNet 单次识别窗口的超时时间。
+
+endmenu

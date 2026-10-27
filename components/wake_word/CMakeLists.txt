@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "wake_word.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp-sr
+        audio_service
+        freertos
+        esp_timer
+)

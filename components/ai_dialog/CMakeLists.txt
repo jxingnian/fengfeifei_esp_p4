@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "ai_dialog.c"
+        "ai_dialog_logic.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        audio_service
+        coze_app
+        wake_word
+        cjson
+        freertos
+        esp_timer
+        esp_audio_codec
+        esp-sr
+)
