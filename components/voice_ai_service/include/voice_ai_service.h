@@ -14,7 +14,8 @@ extern "C" {
  * @brief 初始化设备端 AI 实时语音会话服务。
  *
  * 该服务只负责 Coze 实时语音会话的状态管理、音频上行和音频下行，
- * 不负责设备配对，也不直接保存或访问 Coze Token。Token 始终只保留在后台。
+ * 不负责设备配对，也不直接实现 Coze 协议。Token 由本地 sdkconfig 提供给
+ * 应用层后端适配器，运行时仅由适配器交给生成的 esp_coze 组件使用。
  */
 esp_err_t voice_ai_service_init(void);
 /** Startup-only PCM then Opus tone test; microphone/RTC must be stopped. */

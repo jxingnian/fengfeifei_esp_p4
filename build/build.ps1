@@ -34,8 +34,40 @@ $env:IDF_PATH = $IdfPath
 $env:IDF_PYTHON_ENV_PATH = Split-Path $pythonPath -Parent | Split-Path -Parent
 $env:PYTHONUTF8 = '1'
 
-# 组件覆盖源码位于项目 components 目录，禁止脚本修改 managed_components、
-# sdkconfig 或其他生成文件中的源代码；组件管理器会自动使用本地覆盖组件。
+#
+# 将本地 Coze 凭据作为 Kconfig 默认值注入。凭据文件位于 build 目录并被
+# .gitignore 忽略，因此不会进入源码或版本库；每次配置构建都会重新使用它，
+# 避免直接修改 sdkconfig 后被 Kconfig 重新生成覆盖。
+#
+$localCozeDefaults = Join-Path $projectPath 'build\coze.local.defaults'
+$idfCmakeArguments = @()
+if (Test-Path -LiteralPath $localCozeDefaults -PathType Leaf) {
+    #
+    # sdkconfig 中若保留旧的空字符串，Kconfig 会优先使用它而忽略默认值。
+    # 因此在配置前按键名同步本地凭据，确保生成的 sdkconfig.h 与本地配置一致。
+    #
+    $sdkconfigPath = Join-Path $projectPath 'sdkconfig'
+    $sdkconfigLines = @()
+    if (Test-Path -LiteralPath $sdkconfigPath -PathType Leaf) {
+        $sdkconfigLines = @(Get-Content -LiteralPath $sdkconfigPath -Encoding utf8)
+    }
+    foreach ($localLine in @(Get-Content -LiteralPath $localCozeDefaults -Encoding utf8)) {
+        if ($localLine -match '^(CONFIG_VOICE_AI_BACKEND_COZE_DIRECT|CONFIG_VOICE_AI_COZE_BOT_ID|CONFIG_VOICE_AI_COZE_ACCESS_TOKEN|CONFIG_VOICE_AI_COZE_USER_ID)=') {
+            $configKey = $Matches[1]
+            $sdkconfigLines = @($sdkconfigLines | Where-Object { $_ -notmatch "^$configKey=" })
+            $sdkconfigLines += $localLine
+        }
+    }
+    [System.IO.File]::WriteAllLines(
+        $sdkconfigPath,
+        $sdkconfigLines,
+        (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+
+    $idfCmakeArguments += "-DSDKCONFIG_DEFAULTS=$projectPath\sdkconfig.defaults;$localCozeDefaults"
+}
+
+# 组件覆盖源码位于项目 components 目录，脚本禁止修改 managed_components；
+# 仅同步被忽略的 sdkconfig 凭据配置，组件管理器自动使用本地覆盖组件。
 if (-not $env:ESP_IDF_VERSION) {
     $idfVersionDirectory = Split-Path (Split-Path $IdfPath -Parent) -Leaf
     if ($idfVersionDirectory.StartsWith('v')) {
@@ -45,7 +77,7 @@ if (-not $env:ESP_IDF_VERSION) {
 
 Push-Location $projectPath
 try {
-    & $pythonPath $idfPyPath build
+    & $pythonPath $idfPyPath @idfCmakeArguments build
     if ($LASTEXITCODE -ne 0) {
         throw "ESP-IDF build 失败，退出码：$LASTEXITCODE"
     }

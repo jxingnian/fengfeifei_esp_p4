@@ -1,4 +1,47 @@
 menu "AI voice turn and playback"
+    choice VOICE_AI_BACKEND
+        prompt "AI backend"
+        default VOICE_AI_BACKEND_CLOUD
+        help
+            Select the application-layer AI backend. The generated esp_coze
+            component is never modified by this choice.
+
+        config VOICE_AI_BACKEND_CLOUD
+            bool "Cloud gateway AI"
+
+        config VOICE_AI_BACKEND_COZE_DIRECT
+            bool "Direct Coze connection"
+    endchoice
+
+    config VOICE_AI_COZE_BOT_ID
+        string "Coze Bot ID"
+        depends on VOICE_AI_BACKEND_COZE_DIRECT
+        default "7699765325453639731"
+        help
+            Bot ID used by the direct Coze application backend.
+
+    config VOICE_AI_COZE_ACCESS_TOKEN
+        string "Coze access token"
+        depends on VOICE_AI_BACKEND_COZE_DIRECT
+        default "sat_iCmHvwLS9yqGVX7HasVAIcB9lH0TAlKf5tuNp44G3kesp0Xv01rYjGuS1Td8uKXL"
+        help
+            PAT, OAuth or JWT bearer token. Keep the value in local sdkconfig;
+            do not commit sdkconfig or put the token into source files.
+
+    config VOICE_AI_COZE_USER_ID
+        string "Coze user ID"
+        depends on VOICE_AI_BACKEND_COZE_DIRECT
+        default "p4c5-device"
+        help
+            Stable user ID used to keep the Coze conversation identity.
+
+    config VOICE_AI_VERBOSE_STATS
+        bool "Enable periodic audio pipeline statistics"
+        default n
+        help
+            Print five-second audio throughput, queue and stack statistics.
+            Keep disabled during normal operation to reduce serial log volume.
+
     config VOICE_AI_VAD_MODE
         int "WebRTC VAD aggressiveness (higher rejects more noise)"
         range 0 4

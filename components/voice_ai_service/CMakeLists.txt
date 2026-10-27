@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "voice_ai_service.c"
+        "voice_ai_backend.c"
         "voice_audio_test.c"
     INCLUDE_DIRS
         "include"
@@ -13,4 +14,6 @@ idf_component_register(
         esp_timer
         esp_audio_codec
         esp-sr
+        voice_ai_logic
+        esp_coze
 )

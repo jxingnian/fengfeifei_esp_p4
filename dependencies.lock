@@ -189,6 +189,32 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.5.11
+  espressif/esp_coze:
+    component_hash: e448e7fe42fbe8757425a14d1524fe2ee23f0ad91bea302dfdaa0edd37fd8da0
+    dependencies:
+    - name: espressif/cjson
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=6.0
+      version: ^1.7.19
+    - name: espressif/esp_websocket_client
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.7.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32
+    - esp32s3
+    - esp32s2
+    - esp32p4
+    - esp32c3
+    - esp32c6
+    - esp32c5
+    - esp32s31
+    version: 1.0.0
   espressif/esp_h264:
     component_hash: 3d60078419ceac61cd87579664ae6a5a9b9a42d6f2edf4e23d753af8d2a67da9
     dependencies:
@@ -531,6 +557,7 @@ direct_dependencies:
 - espressif/esp_cam_sensor
 - espressif/esp_capture
 - espressif/esp_codec_dev
+- espressif/esp_coze
 - espressif/esp_h264
 - espressif/esp_hosted
 - espressif/esp_image_effects
@@ -548,6 +575,6 @@ direct_dependencies:
 - livekit/livekit
 - tempotian/av_render
 - tempotian/media_lib_sal
-manifest_hash: 3eb925ef5ccf851fbe71c7325d7ea5a7b9c0251181c3576b61d71aef05a19d56
+manifest_hash: 746de9306fe0330ccacc40a5d7caad51427298d70190ec871492d518d0aac41a
 target: esp32p4
 version: 3.0.0

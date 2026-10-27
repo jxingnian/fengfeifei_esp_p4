@@ -1,13 +1,19 @@
-/* Half-duplex voice pipeline, following Xiaozhi's separate codec/output tasks.
- * Capture never encodes or waits for network/playback. Protocol v2 requires
- * client endpointing and playback credit at BOTH ends. */
+/**
+ * @file voice_ai_service.c
+ * @brief AI 对话应用层。
+ *
+ * 本文件只负责把唤醒服务、音频流水线和抽象 AI 后端连接起来。会话状态由
+ * voice_ai_logic 维护，Coze 与云端协议由 voice_ai_backend 维护；本文件不
+ * 直接包含任何生成组件的内部实现。
+ */
 #include "voice_ai_service.h"
+#include "voice_ai_backend.h"
+#include "voice_ai_logic.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
-#include "cloud_gateway.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -35,16 +41,14 @@
 #define MAX_PCM_BYTES 8192U
 #define CONTROL_QUEUE_LENGTH 32U
 
-typedef enum { AI_IDLE, AI_LISTEN, AI_WAIT, AI_PLAY } ai_state_t;
 typedef struct { unsigned generation; int16_t samples[FRAME_SAMPLES]; } capture_t;
 typedef struct { size_t length; uint8_t *data; unsigned turn, seq; } packet_t;
 typedef struct { size_t length; uint8_t *data; unsigned generation, turn, seq; } pcm_t;
 static const char *TAG = "voice_ai_service";
 static QueueHandle_t s_control_queue, s_audio_queue, s_encode_queue, s_pcm_queue;
 static SemaphoreHandle_t s_control_mutex, s_encoder_mutex, s_decoder_mutex, s_output_mutex, s_capture_mutex;
-static atomic_bool s_initialized, s_session_active, s_ready, s_wake_requested, s_restore_pending, s_speech_started;
-static atomic_int s_state;
-static atomic_uint s_generation, s_turn, s_ready_epoch, s_failure;
+static atomic_bool s_initialized, s_ready, s_wake_requested, s_restore_pending, s_speech_started;
+static atomic_uint s_generation, s_turn, s_failure;
 static atomic_uint s_produced_samples, s_encoded, s_decoded, s_written, s_tx_bytes;
 static atomic_uint s_capture_drops, s_encode_drops, s_rx_drops, s_decode_drops, s_write_drops;
 static atomic_uint s_completed_seq, s_encoder_stack_free, s_decoder_stack_free, s_output_stack_free;
@@ -70,10 +74,13 @@ static const char *json_str(cJSON *root, const char *key)
     const char *s = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, key));
     return s ? s : "";
 }
-static bool playing(void) { return atomic_load(&s_state) == AI_PLAY; }
+static bool playing(void)
+{
+    return voice_ai_logic_get_state() == VOICE_AI_LOGIC_STATE_PLAYING;
+}
 static bool current(unsigned generation, unsigned turn)
 {
-    return atomic_load(&s_session_active) && generation == atomic_load(&s_generation) && turn == atomic_load(&s_turn);
+    return voice_ai_logic_is_session_active() && generation == atomic_load(&s_generation) && turn == atomic_load(&s_turn);
 }
 static void clear_packets(QueueHandle_t queue)
 {
@@ -92,35 +99,34 @@ static void reset_capture(void)
     xQueueReset(s_encode_queue);
     xSemaphoreGive(s_capture_mutex);
 }
-static esp_err_t event(const char *type, bool ordered)
-{
-    char text[128];
-    int len = snprintf(text, sizeof(text), "{\"type\":\"%s\",\"turnId\":%u}", type, atomic_load(&s_turn));
-    return ordered ? cloud_gateway_send_audio_end(text, len) : cloud_gateway_send(false, text, len);
-}
 static void acknowledge(unsigned turn, unsigned seq)
 {
-    char text[128];
-    int len = snprintf(text, sizeof(text), "{\"type\":\"playback_progress\",\"turnId\":%u,\"sequence\":%u}", turn, seq);
-    if (cloud_gateway_send(false, text, len) != ESP_OK) ESP_LOGW(TAG, "Credit deferred: turn=%u seq=%u", turn, seq);
+    voice_ai_backend_playback_progress(turn, seq);
 }
-/* Control mutex serializes public RTC stop. Inactive BEFORE waiting for workers:
- * no old writer or encoder survives return. RTC owns hardware after stop. */
+
+/**
+ * @brief 清理应用层音频资源并让逻辑层回到待机。
+ *
+ * 先将逻辑层置为待机，再等待编码、解码和播放任务退出当前数据，保证
+ * 通话接管硬件时不会再有旧会话写入麦克风或扬声器。
+ */
 static void finish(const char *reason, bool notify, bool restore)
 {
-    bool active = atomic_exchange(&s_session_active, false);
-    atomic_store(&s_state, AI_IDLE); atomic_store(&s_wake_requested, false);
+    bool active = voice_ai_logic_is_session_active();
+    voice_ai_logic_reset();
+    atomic_store(&s_wake_requested, false);
+    if (active && notify) (void)voice_ai_backend_cancel(atomic_load(&s_turn));
     reset_capture();
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
     xSemaphoreTake(s_decoder_mutex, portMAX_DELAY);
     xSemaphoreTake(s_output_mutex, portMAX_DELAY);
-    cloud_gateway_discard_audio(); clear_packets(s_audio_queue); clear_pcm();
+    voice_ai_backend_stop(); clear_packets(s_audio_queue); clear_pcm();
     (void)voice_board_audio_set_output_enabled(false);
     xSemaphoreGive(s_output_mutex); xSemaphoreGive(s_decoder_mutex); xSemaphoreGive(s_encoder_mutex);
     atomic_store(&s_failure, 0);
     voice_service_stop_conversation(); atomic_store(&s_end_seen, false);
     atomic_store(&s_restore_pending, restore);
-    if (active && notify) (void)event("cancel", false);
+    voice_ai_backend_stop();
     ESP_LOGI(TAG, "turn=%u session ended: %s", atomic_load(&s_turn), reason);
 }
 static esp_opus_dec_frame_duration_t duration(unsigned us)
@@ -167,7 +173,7 @@ static bool audio_format(cJSON *format)
 static void ready(cJSON *root)
 {
     atomic_store(&s_ready, false);
-    if (atomic_load(&s_session_active)) finish("new audio configuration", false, true);
+    if (voice_ai_logic_is_session_active()) finish("new audio configuration", false, true);
     cJSON *in = cJSON_GetObjectItemCaseSensitive(root, "input"), *out = cJSON_GetObjectItemCaseSensitive(root, "output");
     if (json_uint(root, "voiceProtocol") != 2 ||
         (strcmp(json_str(root, "turnDetection"), "client_interrupt") && strcmp(json_str(root, "turnDetection"), "server_vad")) ||
@@ -181,12 +187,13 @@ static void ready(cJSON *root)
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY); xSemaphoreTake(s_decoder_mutex, portMAX_DELAY);
     bool ok = open_codecs(!strcmp(json_str(in, "codec"), "opus"), !strcmp(json_str(out, "codec"), "opus"), us);
     xSemaphoreGive(s_decoder_mutex); xSemaphoreGive(s_encoder_mutex);
-    cloud_gateway_status_t status;
-    if (ok && cloud_gateway_get_status(&status) == ESP_OK && status.state == CLOUD_GATEWAY_READY) {
-        atomic_store(&s_ready_epoch, status.connection_epoch); atomic_store(&s_ready, true);
-        ESP_LOGI(TAG, "Ready v2: input=%s output=%s, turn_detection=%s, output=%uus credit=600ms/24packets",
+    if (ok) {
+        atomic_store(&s_ready, true);
+        ESP_LOGI(TAG, "云端音频配置就绪：input=%s output=%s, turn_detection=%s, output=%uus",
             json_str(in, "codec"), json_str(out, "codec"), s_server_vad ? "server_vad" : "client_interrupt", us);
-    } else ESP_LOGE(TAG, "Audio codec initialization failed");
+    } else {
+        ESP_LOGE(TAG, "云端音频编解码器初始化失败");
+    }
 }
 static bool begin_turn(void)
 {
@@ -194,8 +201,10 @@ static bool begin_turn(void)
     reset_capture(); atomic_fetch_add(&s_turn, 1);
     atomic_store(&s_completed_seq, 0); atomic_store(&s_end_seen, false); atomic_store(&s_speech_started, false);
     atomic_store(&s_listen_since, now_ms());
-    if (event("audio_start", false) != ESP_OK) { atomic_store(&s_failure, 1); return false; }
-    atomic_store(&s_state, AI_LISTEN);
+    if (voice_ai_backend_begin_turn(atomic_load(&s_turn)) != ESP_OK) {
+        atomic_store(&s_failure, 1);
+        return false;
+    }
     ESP_LOGI(TAG, "turn=%u listening: mode=%s pre-roll=300ms tail=%dms no-speech=%dms max=%dms", atomic_load(&s_turn),
         s_server_vad ? "server_vad" : "client_interrupt",
         CONFIG_VOICE_AI_TAIL_SILENCE_MS, CONFIG_VOICE_AI_NO_SPEECH_MS, CONFIG_VOICE_AI_MAX_TURN_MS);
@@ -207,25 +216,120 @@ static void process_text(packet_t *packet)
     if (!root) return;
     const char *type = json_str(root, "type");
     if (!strcmp(type, "ready")) ready(root);
-    else if (atomic_load(&s_session_active) && json_uint(root, "turnId") == atomic_load(&s_turn)) {
-        if (!strcmp(type, "audio_start") && (atomic_load(&s_state) == AI_WAIT ||
-            (s_server_vad && atomic_load(&s_state) == AI_LISTEN))) {
+    else if (voice_ai_logic_is_session_active() && json_uint(root, "turnId") == atomic_load(&s_turn)) {
+        if (!strcmp(type, "audio_start") &&
+            (voice_ai_logic_get_state() == VOICE_AI_LOGIC_STATE_WAITING_REPLY ||
+             (s_server_vad && voice_ai_logic_get_state() == VOICE_AI_LOGIC_STATE_LISTENING))) {
+            (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_AUDIO_STARTED);
             if (voice_service_stop() != ESP_OK || voice_board_audio_set_output_enabled(true) != ESP_OK) finish("speaker/capture transition failed", true, true);
             else {
-                atomic_store(&s_audio_since, now_ms()); atomic_store(&s_state, AI_PLAY);
+                atomic_store(&s_audio_since, now_ms());
                 ESP_LOGI(TAG, "turn=%u first_audio after commit=%lldms", atomic_load(&s_turn), now_ms() - atomic_load(&s_wait_since));
             }
         } else if (!strcmp(type, "audio_end") && playing()) {
-            s_end_sequence = json_uint(root, "lastSequence"); atomic_store(&s_end_seen, true);
-        } else if (!strcmp(type, "audio_stop")) finish("backend stopped response", false, true);
-        else if (!strcmp(type, "error")) finish(json_str(root, "message"), false, true);
+            s_end_sequence = json_uint(root, "lastSequence");
+            (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_AUDIO_ENDED);
+            atomic_store(&s_end_seen, true);
+        } else if (!strcmp(type, "audio_stop")) {
+            (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_BACKEND_STOPPED);
+            finish("backend stopped response", false, true);
+        } else if (!strcmp(type, "error")) {
+            (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_BACKEND_ERROR);
+            finish(json_str(root, "message"), false, true);
+        }
         else if (!strcmp(type, "transcript")) ESP_LOGI(TAG, "turn=%u transcript received", atomic_load(&s_turn));
-    } else if (!strcmp(type, "error") && !json_uint(root, "turnId") && atomic_load(&s_session_active)) finish(json_str(root, "message"), false, true);
+    } else if (!strcmp(type, "error") && !json_uint(root, "turnId") && voice_ai_logic_is_session_active()) {
+        (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_BACKEND_ERROR);
+        finish(json_str(root, "message"), false, true);
+    }
     cJSON_Delete(root);
+}
+
+/**
+ * @brief 把直连后端事件复制到应用层控制/音频队列。
+ *
+ * Coze 回调运行在 WebSocket 任务中，不能在回调里执行状态迁移、编解码或
+ * 播放。这里仅复制数据并零等待入队，所有后续动作由应用控制任务串行处理。
+ */
+static void on_backend_event(const voice_ai_backend_event_t *event, void *context)
+{
+    (void)context;
+    if (event == NULL || !atomic_load(&s_initialized)) {
+        return;
+    }
+
+    if (event->type == VOICE_AI_BACKEND_EVENT_AUDIO_DATA) {
+        if (event->data == NULL || event->length == 0 || event->length > MAX_PACKET) {
+            atomic_fetch_add(&s_rx_drops, 1);
+            return;
+        }
+
+        packet_t packet = {
+            .length = event->length,
+            .data = malloc(event->length),
+            .turn = event->turn,
+            .seq = event->sequence,
+        };
+        if (packet.data == NULL) {
+            atomic_fetch_add(&s_rx_drops, 1);
+            return;
+        }
+        memcpy(packet.data, event->data, event->length);
+        if (xQueueSend(s_audio_queue, &packet, 0) != pdTRUE) {
+            packet_t discarded;
+            if (xQueueReceive(s_audio_queue, &discarded, 0) == pdTRUE) {
+                free(discarded.data);
+                atomic_fetch_add(&s_rx_drops, 1);
+            }
+            if (xQueueSend(s_audio_queue, &packet, 0) != pdTRUE) {
+                free(packet.data);
+                atomic_fetch_add(&s_rx_drops, 1);
+            }
+        }
+        return;
+    }
+
+    char message[192];
+    const char *type = "error";
+    if (event->type == VOICE_AI_BACKEND_EVENT_AUDIO_START) {
+        type = "audio_start";
+        snprintf(message, sizeof(message),
+                 "{\"type\":\"%s\",\"turnId\":%u}", type, event->turn);
+    } else if (event->type == VOICE_AI_BACKEND_EVENT_AUDIO_END) {
+        type = "audio_end";
+        snprintf(message, sizeof(message),
+                 "{\"type\":\"%s\",\"turnId\":%u,\"lastSequence\":%u}",
+                 type, event->turn, event->sequence);
+    } else if (event->type == VOICE_AI_BACKEND_EVENT_DISCONNECTED) {
+        snprintf(message, sizeof(message),
+                 "{\"type\":\"error\",\"turnId\":%u,\"message\":\"AI backend disconnected\"}",
+                 event->turn);
+    } else {
+        snprintf(message, sizeof(message),
+                 "{\"type\":\"error\",\"turnId\":%u,\"message\":\"AI backend error\"}",
+                 event->turn);
+    }
+
+    packet_t packet = {
+        .length = strlen(message),
+        .data = malloc(strlen(message)),
+        .turn = event->turn,
+        .seq = event->sequence,
+    };
+    if (packet.data == NULL) {
+        atomic_store(&s_failure, 4);
+        return;
+    }
+    memcpy(packet.data, message, packet.length);
+    if (xQueueSendToFront(s_control_queue, &packet, 0) != pdTRUE) {
+        free(packet.data);
+        atomic_store(&s_failure, 4);
+    }
 }
 static bool capture_current(capture_t *frame)
 {
-    return frame->generation == atomic_load(&s_generation) && atomic_load(&s_ready) && atomic_load(&s_session_active) && atomic_load(&s_state) == AI_LISTEN;
+    return frame->generation == atomic_load(&s_generation) && atomic_load(&s_ready) &&
+        voice_ai_logic_can_capture();
 }
 /* 32KB encoder stack only; encoder mutex held. */
 static void encode_send(capture_t *frame)
@@ -241,7 +345,7 @@ static void encode_send(capture_t *frame)
         data = s_encoded_buffer; size = out.encoded_bytes;
     }
     if (capture_current(frame)) {
-        if (cloud_gateway_send(true, data, size) == ESP_OK) { atomic_fetch_add(&s_encoded, 1); atomic_fetch_add(&s_tx_bytes, size); }
+        if (voice_ai_backend_send_audio(data, size) == ESP_OK) { atomic_fetch_add(&s_encoded, 1); atomic_fetch_add(&s_tx_bytes, size); }
         else atomic_fetch_add(&s_encode_drops, 1);
     }
     atomic_store(&s_encoder_stack_free, uxTaskGetStackHighWaterMark(NULL));
@@ -279,8 +383,9 @@ static void voice_ai_encode_worker(void *arg)
             if (result == TURN_COMMIT && capture_current(&frame)) {
                 /* Current encoded frame includes the trailing silence. Partial raw
                  * capture after this boundary belongs to no submitted turn. */
-                atomic_store(&s_wait_since, now_ms()); atomic_store(&s_state, AI_WAIT);
-                if (event("audio_end", true) != ESP_OK) atomic_store(&s_failure, 1);
+                atomic_store(&s_wait_since, now_ms());
+                (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_TURN_COMMITTED);
+                if (voice_ai_backend_commit_audio(atomic_load(&s_turn)) != ESP_OK) atomic_store(&s_failure, 1);
                 ESP_LOGI(TAG, "turn=%u speech_end/commit at +%ums tail=%ums; upload stopped", atomic_load(&s_turn), turn.elapsed_ms, turn.silence_ms);
             } else if (result == TURN_EMPTY) atomic_store(&s_failure, 2);
         }
@@ -382,7 +487,8 @@ static void try_drain(void)
         error = voice_board_audio_drain(); (void)voice_board_audio_set_output_enabled(false);
         acknowledge(atomic_load(&s_turn), s_end_sequence);
         ESP_LOGI(TAG, "turn=%u playback_drained seq=%u/%u dma=%s", atomic_load(&s_turn), atomic_load(&s_completed_seq), s_end_sequence, esp_err_to_name(error));
-        atomic_store(&s_state, AI_WAIT); atomic_store(&s_end_seen, false);
+        (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_PLAYBACK_DRAINED);
+        atomic_store(&s_end_seen, false);
     }
     xSemaphoreGive(s_output_mutex); xSemaphoreGive(s_decoder_mutex);
     if (drained) {
@@ -393,35 +499,50 @@ static void try_drain(void)
 static void voice_ai_worker(void *arg)
 {
     (void)arg;
-    int64_t rate_at = now_ms(), progress_at = now_ms();
+    int64_t progress_at = now_ms();
+#if CONFIG_VOICE_AI_VERBOSE_STATS
+    int64_t rate_at = now_ms();
+#endif
     unsigned last_progress = 0;
     for (;;) {
         xSemaphoreTake(s_control_mutex, portMAX_DELAY);
         packet_t p;
         while (xQueueReceive(s_control_queue, &p, 0) == pdTRUE) { process_text(&p); free(p.data); }
-        if (atomic_exchange(&s_wake_requested, false) && !atomic_load(&s_session_active)) {
-            cloud_gateway_status_t status;
-            if (atomic_load(&s_ready) && cloud_gateway_get_status(&status) == ESP_OK && status.state == CLOUD_GATEWAY_READY && status.connection_epoch == atomic_load(&s_ready_epoch)) {
-                atomic_store(&s_session_active, true); (void)begin_turn();
-            } else { voice_service_stop_conversation(); ESP_LOGW(TAG, "Wake ignored: backend v2 not ready"); }
+        if (atomic_exchange(&s_wake_requested, false) &&
+            voice_ai_logic_get_state() == VOICE_AI_LOGIC_STATE_IDLE) {
+            (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_WAKE_DETECTED);
+            if (atomic_load(&s_ready) && voice_ai_backend_start() == ESP_OK) {
+                (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_BACKEND_READY);
+                if (voice_ai_logic_get_state() == VOICE_AI_LOGIC_STATE_LISTENING) {
+                    (void)begin_turn();
+                } else {
+                    finish("backend state transition failed", false, true);
+                }
+            } else {
+                voice_ai_logic_reset();
+                voice_service_stop_conversation();
+                ESP_LOGW(TAG, "唤醒已忽略：AI 后端尚未就绪");
+            }
         }
         unsigned failure = atomic_exchange(&s_failure, 0);
-        if (failure && atomic_load(&s_session_active)) finish(failure == 2 ? "no speech" : "audio pipeline failure", true, true);
-        if (atomic_load(&s_session_active)) {
-            cloud_gateway_status_t status;
-            if (cloud_gateway_get_status(&status) != ESP_OK || status.state != CLOUD_GATEWAY_READY || status.connection_epoch != atomic_load(&s_ready_epoch)) {
-                atomic_store(&s_ready, false); finish("connection lost", false, true);
+        if (failure && voice_ai_logic_is_session_active()) finish(failure == 2 ? "no speech" : "audio pipeline failure", true, true);
+        if (voice_ai_logic_is_session_active()) {
+            if (!voice_ai_backend_connection_is_alive()) {
+                atomic_store(&s_ready, false);
+                (void)voice_ai_logic_handle_event(VOICE_AI_LOGIC_EVENT_BACKEND_STOPPED);
+                finish("connection lost", false, true);
             }
-            int64_t now = now_ms(); int state = atomic_load(&s_state);
+            int64_t now = now_ms();
+            voice_ai_logic_state_t state = voice_ai_logic_get_state();
             // server_vad 的录音阶段可能包含较长静音，不能用设备本地的无语音超时结束会话。
-            if (state == AI_LISTEN && !s_server_vad && !atomic_load(&s_speech_started) && now - atomic_load(&s_listen_since) > CONFIG_VOICE_AI_NO_SPEECH_MS + 300) finish("no speech", true, true);
-            if (state == AI_LISTEN && now - atomic_load(&s_listen_since) > CONFIG_VOICE_AI_MAX_TURN_MS + 2000) finish("capture watchdog", true, true);
-            if (state == AI_WAIT) {
+            if (state == VOICE_AI_LOGIC_STATE_LISTENING && !s_server_vad && !atomic_load(&s_speech_started) && now - atomic_load(&s_listen_since) > CONFIG_VOICE_AI_NO_SPEECH_MS + 300) finish("no speech", true, true);
+            if (state == VOICE_AI_LOGIC_STATE_LISTENING && now - atomic_load(&s_listen_since) > CONFIG_VOICE_AI_MAX_TURN_MS + 2000) finish("capture watchdog", true, true);
+            if (state == VOICE_AI_LOGIC_STATE_WAITING_REPLY) {
                 int64_t waited = now - atomic_load(&s_wait_since);
                 if (waited >= 5000 && !s_wait_warning) { ESP_LOGW(TAG, "turn=%u still waiting for first audio (%lldms)", atomic_load(&s_turn), waited); s_wait_warning = true; }
                 if (waited >= CONFIG_VOICE_AI_REPLY_TIMEOUT_MS) finish("first audio timeout", true, true);
             } else s_wait_warning = false;
-            if (state == AI_PLAY) {
+            if (state == VOICE_AI_LOGIC_STATE_PLAYING) {
                 unsigned completed = atomic_load(&s_completed_seq);
                 if (completed != last_progress) { last_progress = completed; progress_at = now; }
                 if (now - progress_at > 15000 && now - atomic_load(&s_audio_since) > 15000) finish("playback stalled", true, true);
@@ -435,6 +556,7 @@ static void voice_ai_worker(void *arg)
             else if (err != ESP_ERR_INVALID_STATE) ESP_LOGW(TAG, "Capture restore retry: %s", esp_err_to_name(err));
         }
         int64_t now = now_ms();
+#if CONFIG_VOICE_AI_VERBOSE_STATS
         if (now - rate_at >= 5000) {
             unsigned samples = atomic_exchange(&s_produced_samples, 0), enc = atomic_exchange(&s_encoded, 0);
             unsigned bytes = atomic_exchange(&s_tx_bytes, 0), dec = atomic_exchange(&s_decoded, 0), written = atomic_exchange(&s_written, 0);
@@ -448,12 +570,14 @@ static void voice_ai_worker(void *arg)
                 atomic_load(&s_encoder_stack_free), atomic_load(&s_decoder_stack_free), atomic_load(&s_output_stack_free),
                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
         }
+#endif
         xSemaphoreGive(s_control_mutex); vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 esp_err_t voice_ai_service_init(void)
 {
     if (atomic_load(&s_initialized)) return ESP_ERR_INVALID_STATE;
+    if (voice_ai_logic_init() != ESP_OK) return ESP_FAIL;
     s_control_queue = xQueueCreate(CONTROL_QUEUE_LENGTH, sizeof(packet_t)); s_audio_queue = xQueueCreate(AUDIO_QUEUE_LENGTH, sizeof(packet_t));
     s_encode_queue = xQueueCreateWithCaps(ENCODE_QUEUE_LENGTH, sizeof(capture_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_pcm_queue = xQueueCreate(PCM_QUEUE_LENGTH, sizeof(pcm_t));
@@ -462,6 +586,28 @@ esp_err_t voice_ai_service_init(void)
     s_vad = vad_create((vad_mode_t)CONFIG_VOICE_AI_VAD_MODE);
     TaskHandle_t tasks[4] = {0};
     if (!s_control_queue || !s_audio_queue || !s_encode_queue || !s_pcm_queue || !s_control_mutex || !s_capture_mutex || !s_encoder_mutex || !s_decoder_mutex || !s_output_mutex || !s_vad) goto fail;
+    voice_ai_backend_config_t backend_config = {
+        .on_event = on_backend_event,
+        .context = NULL,
+    };
+    if (voice_ai_backend_init(&backend_config) != ESP_OK) goto fail;
+
+    /* 直连模式没有云端 ready 消息，因此应用层在启动时固定初始化 Coze 音频格式。 */
+    if (voice_ai_backend_is_direct()) {
+        voice_ai_backend_audio_config_t audio_config;
+        if (voice_ai_backend_get_audio_config(&audio_config) != ESP_OK) goto fail;
+        xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
+        xSemaphoreTake(s_decoder_mutex, portMAX_DELAY);
+        bool codec_ok = open_codecs(audio_config.input_opus,
+                                    audio_config.output_opus,
+                                    audio_config.output_frame_us);
+        xSemaphoreGive(s_decoder_mutex);
+        xSemaphoreGive(s_encoder_mutex);
+        if (!codec_ok) goto fail;
+        s_server_vad = audio_config.server_vad;
+        atomic_store(&s_ready, true);
+    }
+
     if (xTaskCreate(voice_ai_encode_worker, "voice_ai_enc", VOICE_AI_ENCODER_STACK_BYTES, NULL, 4, &tasks[0]) != pdPASS ||
         xTaskCreate(voice_ai_decode_worker, "voice_ai_dec", VOICE_AI_WORKER_STACK_BYTES, NULL, 4, &tasks[1]) != pdPASS ||
         xTaskCreate(voice_ai_output_worker, "voice_ai_out", 6144, NULL, 5, &tasks[2]) != pdPASS ||
@@ -484,10 +630,10 @@ void voice_ai_service_on_wake_detected(void)
 void voice_ai_service_on_pcm(const int16_t *samples, size_t count, void *context)
 {
     (void)context;
-    if (!samples || !count || !atomic_load(&s_initialized) || atomic_load(&s_state) != AI_LISTEN) return;
+    if (!samples || !count || !atomic_load(&s_initialized) || !voice_ai_logic_can_capture()) return;
     atomic_fetch_add(&s_produced_samples, count);
     if (xSemaphoreTake(s_capture_mutex, 0) != pdTRUE) { atomic_fetch_add(&s_capture_drops, 1); return; }
-    if (atomic_load(&s_state) == AI_LISTEN) {
+    if (voice_ai_logic_can_capture()) {
         while (count) {
             size_t n = FRAME_SAMPLES - s_captured; if (n > count) n = count;
             memcpy(s_capture_frame.samples + s_captured, samples, n * sizeof(int16_t)); samples += n; count -= n; s_captured += n;
@@ -509,11 +655,12 @@ static unsigned read_le32(const uint8_t *p)
 }
 void voice_ai_service_on_cloud_message(bool binary, const void *data, size_t length)
 {
-    if (!atomic_load(&s_initialized) || !data || !length) return;
+    /* 直连模式只保留云端网关的设备管理和通话用途，禁止云端 AI 消息进入队列。 */
+    if (voice_ai_backend_is_direct() || !atomic_load(&s_initialized) || !data || !length) return;
     packet_t p = {0}; bool urgent = false;
     if (binary) {
         const uint8_t *b = data;
-        if (!atomic_load(&s_session_active) || length < 13 || length > MAX_PACKET + 12 || b[0] != 0x56 || b[1] != 0x41 || b[2] != 2 || b[3] != 0) return;
+        if (!voice_ai_logic_is_session_active() || length < 13 || length > MAX_PACKET + 12 || b[0] != 0x56 || b[1] != 0x41 || b[2] != 2 || b[3] != 0) return;
         p.turn = read_le32(b + 4); p.seq = read_le32(b + 8);
         if (!p.seq || p.turn != atomic_load(&s_turn)) return;
         data = b + 12; length -= 12;
@@ -546,4 +693,4 @@ void voice_ai_service_stop_session(const char *reason)
     finish(reason ? reason : "external stop", true, false);
     xSemaphoreGive(s_control_mutex);
 }
-bool voice_ai_service_is_session_active(void) { return atomic_load(&s_session_active); }
+bool voice_ai_service_is_session_active(void) { return voice_ai_logic_is_session_active(); }
