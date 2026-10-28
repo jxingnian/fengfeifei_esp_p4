@@ -4,7 +4,7 @@ idf_component_register(
     INCLUDE_DIRS
         "."
     REQUIRES
-        audio_driver
+        drv_audio_es8311
         esp-sr
         freertos
 )

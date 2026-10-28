@@ -19,11 +19,14 @@ extern "C" {
 #endif
 
 typedef enum {
-    COZE_APP_EVENT_AUDIO_START = 0,
-    COZE_APP_EVENT_AUDIO_DATA,
-    COZE_APP_EVENT_AUDIO_END,
-    COZE_APP_EVENT_ERROR,
-    COZE_APP_EVENT_DISCONNECTED,
+    COZE_APP_EVENT_CONNECTED = 0,       // WebSocket连接成功
+    COZE_APP_EVENT_READY,               // Coze服务就绪，可以开始对话
+    COZE_APP_EVENT_AUDIO_START,         // AI开始回复音频
+    COZE_APP_EVENT_AUDIO_DATA,          // AI音频数据
+    COZE_APP_EVENT_AUDIO_END,           // AI音频结束
+    COZE_APP_EVENT_TURN_END,            // 本轮对话结束
+    COZE_APP_EVENT_ERROR,               // 错误
+    COZE_APP_EVENT_DISCONNECTED,        // 连接断开
 } coze_app_event_type_t;
 
 /**
@@ -68,16 +71,76 @@ typedef struct {
     unsigned output_frame_us;
 } coze_app_audio_config_t;
 
+/**
+ * @brief 初始化Coze应用组件（不建立连接）
+ */
 esp_err_t coze_app_init(const coze_app_config_t *config);
-esp_err_t coze_app_start(void);
+
+/**
+ * @brief 连接到Coze服务（后台长连接）
+ *
+ * 该函数在网络就绪后调用一次，建立WebSocket连接并保持
+ */
+esp_err_t coze_app_connect(void);
+
+/**
+ * @brief 重连Coze服务（网络恢复后）
+ */
+esp_err_t coze_app_reconnect(void);
+
+/**
+ * @brief 开始新一轮对话（唤醒后调用）
+ */
 esp_err_t coze_app_begin_turn(unsigned turn);
+
+/**
+ * @brief 发送音频数据
+ */
 esp_err_t coze_app_send_audio(const uint8_t *data, size_t length);
+
+/**
+ * @brief 提交音频（用户停止说话）
+ */
 esp_err_t coze_app_commit_audio(unsigned turn);
+
+/**
+ * @brief 取消当前轮次
+ */
 esp_err_t coze_app_cancel(unsigned turn);
-void coze_app_stop(void);
+
+/**
+ * @brief 结束当前轮次（但不断开连接）
+ */
+esp_err_t coze_app_end_turn(unsigned turn);
+
+/**
+ * @brief 断开连接并停止服务
+ */
+void coze_app_disconnect(void);
+
+/**
+ * @brief 反初始化
+ */
+void coze_app_deinit(void);
+
+/**
+ * @brief 播放进度反馈
+ */
 void coze_app_playback_progress(unsigned turn, unsigned sequence);
+
+/**
+ * @brief 检查Coze服务是否就绪
+ */
 bool coze_app_is_ready(void);
-bool coze_app_connection_is_alive(void);
+
+/**
+ * @brief 检查连接是否存活
+ */
+bool coze_app_is_connected(void);
+
+/**
+ * @brief 获取音频配置
+ */
 esp_err_t coze_app_get_audio_config(coze_app_audio_config_t *config);
 
 #ifdef __cplusplus

@@ -1,28 +1,44 @@
 /*
  * @file app_main.c
- * @brief 当前阶段设备固件启动入口。
+ * @brief 设备固件主入口 - 完整架构版本
  *
- * 设备目前只启用 Wi-Fi 配网、统一音频服务、Coze 直连 AI 对话和本地
- * 唤醒词。视频通话、后台网关以及小程序链路不在本固件启动图中，后续
- * 接入新业务时应作为独立组件注册到系统状态机，而不是重新塞入本文件。
+ * 本版本采用分层架构设计：
+ * - 设备状态机：统一调度、资源仲裁、状态转换
+ * - 应用层：AI对话、语音通话、视频通话业务
+ * - 服务层：音频服务、Coze服务、后台连接服务
+ * - 驱动层：音频驱动、网络驱动、视频驱动
  */
-#include "p4_c5_wifi.h"
-#include "audio_service.h"
-#include "ai_dialog.h"
-#include "wake_word.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// 驱动和服务层
+#include "p4_c5_wifi.h"
+#include "audio_service.h"
+
+// 业务组件
+#include "wake_word.h"
+#include "ai_dialog.h"
+#include "coze_app.h"
+#include "voice_call.h"
+#include "video_call.h"
+
+// 设备状态机
+#include "device_state_machine.h"
 
 static const char *TAG = "app_main";
 
-/**
- * @brief 初始化 NVS。
- *
- * Wi-Fi 配网组件和 ESP-Hosted 参数都依赖 NVS；遇到旧版本或空间不足时
- * 按 ESP-IDF 约定擦除后重新初始化，保证设备可以从干净状态启动。
- */
+// ========== 全局变量 ==========
+static bool s_coze_connected = false;
+static unsigned s_ai_turn = 0;
+
+// ========== NVS初始化 ==========
+
 static void app_initialize_nvs(void)
 {
     esp_err_t error = nvs_flash_init();
@@ -34,12 +50,106 @@ static void app_initialize_nvs(void)
     ESP_ERROR_CHECK(error);
 }
 
-/**
- * @brief 处理唤醒词服务事件。
- *
- * 回调只做状态日志和快速投递。AI 网络连接、编解码和播放全部在 ai_dialog
- * 自己的任务中执行，避免 Wi-Fi 或串口日志阻塞麦克风采集任务。
- */
+// ========== Coze事件处理 ==========
+
+static void app_on_coze_event(const coze_app_event_t *event, void *context)
+{
+    (void)context;
+    if (event == NULL) {
+        return;
+    }
+
+    switch (event->type) {
+    case COZE_APP_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "Coze WebSocket已连接");
+        s_coze_connected = true;
+        break;
+
+    case COZE_APP_EVENT_READY:
+        ESP_LOGI(TAG, "Coze服务就绪");
+        device_state_send_event(EVENT_SERVICE_READY);
+        break;
+
+    case COZE_APP_EVENT_AUDIO_START:
+        ESP_LOGI(TAG, "AI开始回复");
+        device_state_send_event(EVENT_AI_REPLY_START);
+        break;
+
+    case COZE_APP_EVENT_AUDIO_DATA:
+        // AI对话层会处理音频数据
+        break;
+
+    case COZE_APP_EVENT_AUDIO_END:
+        ESP_LOGI(TAG, "AI回复结束");
+        device_state_send_event(EVENT_AI_REPLY_END);
+        break;
+
+    case COZE_APP_EVENT_TURN_END:
+        ESP_LOGI(TAG, "对话轮次结束");
+        break;
+
+    case COZE_APP_EVENT_ERROR:
+        ESP_LOGE(TAG, "Coze错误");
+        device_state_send_event(EVENT_COZE_ERROR);
+        break;
+
+    case COZE_APP_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "Coze连接断开");
+        s_coze_connected = false;
+        device_state_send_event(EVENT_BACKEND_DISCONNECTED);
+        break;
+
+    default:
+        break;
+    }
+}
+
+// ========== AI对话事件处理 ==========
+
+static void app_on_ai_dialog_event(const ai_dialog_event_t *event, void *context)
+{
+    (void)context;
+    if (event == NULL) {
+        return;
+    }
+
+    switch (event->type) {
+    case AI_DIALOG_EVENT_READY:
+        ESP_LOGI(TAG, "AI对话服务就绪");
+        device_state_send_event(EVENT_AI_READY);
+        break;
+
+    case AI_DIALOG_EVENT_LISTENING:
+        ESP_LOGI(TAG, "AI监听用户语音");
+        break;
+
+    case AI_DIALOG_EVENT_USER_SPEAKING:
+        ESP_LOGI(TAG, "检测到用户说话");
+        device_state_send_event(EVENT_USER_SPEAKING);
+        break;
+
+    case AI_DIALOG_EVENT_USER_STOPPED:
+        ESP_LOGI(TAG, "用户停止说话");
+        device_state_send_event(EVENT_USER_STOPPED);
+        break;
+
+    case AI_DIALOG_EVENT_SESSION_END:
+        ESP_LOGI(TAG, "AI会话结束");
+        device_state_send_event(EVENT_CONVERSATION_ENDED);
+        break;
+
+    case AI_DIALOG_EVENT_ERROR:
+        ESP_LOGE(TAG, "AI对话错误：%s", event->message ? event->message : "未知");
+        device_state_send_event(EVENT_COZE_ERROR);
+        break;
+
+    default:
+        break;
+    }
+}
+
+// ========== 唤醒词事件处理 ==========
+
 static void app_on_wake_word_event(
     const wake_word_event_t *event,
     void *user_context
@@ -54,31 +164,33 @@ static void app_on_wake_word_event(
     case WAKE_WORD_EVENT_READY:
         ESP_LOGI(TAG, "唤醒词服务就绪：你好小飞");
         break;
+
     case WAKE_WORD_EVENT_WAKE_DETECTED:
-        ESP_LOGI(TAG, "收到唤醒词事件，概率：%.3f", event->probability);
-        ai_dialog_on_wake_detected();
+        ESP_LOGI(TAG, "检测到唤醒词，概率：%.3f", event->probability);
+        device_state_send_event(EVENT_WAKE_WORD_DETECTED);
         break;
+
     case WAKE_WORD_EVENT_AUDIO_ERROR:
     case WAKE_WORD_EVENT_MODEL_ERROR:
-        ESP_LOGE(TAG, "唤醒词服务错误：%s", esp_err_to_name(event->error));
+        ESP_LOGE(TAG, "唤醒词错误：%s", esp_err_to_name(event->error));
+        device_state_send_event(EVENT_AUDIO_ERROR);
         break;
+
     case WAKE_WORD_EVENT_TIMEOUT:
-        ESP_LOGD(TAG, "本次唤醒识别窗口结束，继续监听");
+        ESP_LOGD(TAG, "唤醒识别窗口结束");
         break;
+
     case WAKE_WORD_EVENT_STOPPED:
-        ESP_LOGI(TAG, "唤醒词采集任务已停止");
+        ESP_LOGI(TAG, "唤醒词采集已停止");
         break;
+
     default:
         break;
     }
 }
 
-/**
- * @brief 把统一音频服务输出的麦克风 PCM 投递给 AI 对话层。
- *
- * 该回调运行在唤醒词采集任务中，只允许非阻塞投递；音频编码和网络发送
- * 由 ai_dialog 的独立任务完成。
- */
+// ========== 麦克风PCM数据转发 ==========
+
 static void app_on_capture_pcm(
     const int16_t *samples,
     size_t sample_count,
@@ -86,41 +198,403 @@ static void app_on_capture_pcm(
 )
 {
     (void)user_context;
-    ai_dialog_on_pcm(samples, sample_count, NULL);
+
+    // 根据当前状态决定PCM数据去向
+    device_state_t state = device_state_get_current();
+
+    if (state == DEVICE_STATE_AI_LISTENING ||
+        state == DEVICE_STATE_AI_PROCESSING ||
+        state == DEVICE_STATE_AI_PLAYING) {
+        // AI对话状态，转发给AI对话层
+        ai_dialog_on_pcm(samples, sample_count, NULL);
+    }
+    // TODO: 通话状态转发给通话组件
 }
 
-/**
- * @brief P4 主应用入口。
- */
+// ========== 语音通话事件处理 ==========
+
+static void app_on_voice_call_event(const voice_call_event_t *event, void *context)
+{
+    (void)context;
+    if (event == NULL) {
+        return;
+    }
+
+    switch (event->type) {
+    case VOICE_CALL_EVENT_INCOMING:
+        ESP_LOGI(TAG, "语音来电：%s", event->caller_id);
+        break;
+
+    case VOICE_CALL_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "语音通话已接通");
+        break;
+
+    case VOICE_CALL_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "语音通话已断开");
+        break;
+
+    case VOICE_CALL_EVENT_ERROR:
+        ESP_LOGE(TAG, "语音通话错误：%s", event->message);
+        break;
+
+    default:
+        break;
+    }
+}
+
+// ========== 视频通话事件处理 ==========
+
+static void app_on_video_call_event(const video_call_event_t *event, void *context)
+{
+    (void)context;
+    if (event == NULL) {
+        return;
+    }
+
+    switch (event->type) {
+    case VIDEO_CALL_EVENT_INCOMING:
+        ESP_LOGI(TAG, "视频来电：%s", event->caller_id);
+        break;
+
+    case VIDEO_CALL_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "视频通话已接通");
+        break;
+
+    case VIDEO_CALL_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "视频通话已断开");
+        break;
+
+    case VIDEO_CALL_EVENT_ERROR:
+        ESP_LOGE(TAG, "视频通话错误：%s", event->message);
+        break;
+
+    default:
+        break;
+    }
+}
+
+// ========== 设备状态机回调函数 ==========
+
+static void on_network_connecting(void)
+{
+    ESP_LOGI(TAG, "[状态机] 网络连接中");
+    // Wi-Fi已经在启动时初始化
+}
+
+static void on_service_starting(void)
+{
+    ESP_LOGI(TAG, "[状态机] 启动后台服务");
+
+    // 初始化Coze应用
+    coze_app_config_t coze_config = {
+        .on_event = app_on_coze_event,
+        .context = NULL,
+    };
+    ESP_ERROR_CHECK(coze_app_init(&coze_config));
+
+    // 连接到Coze服务（后台长连接）
+    esp_err_t error = coze_app_connect();
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "Coze连接失败：%s", esp_err_to_name(error));
+        device_state_send_event(EVENT_COZE_ERROR);
+        return;
+    }
+
+    // 初始化AI对话服务
+    ai_dialog_config_t ai_config = {
+        .on_event = app_on_ai_dialog_event,
+        .context = NULL,
+    };
+    ESP_ERROR_CHECK(ai_dialog_init(&ai_config));
+
+    // Coze READY事件会触发SERVICE_READY
+}
+
+static void on_enter_idle(void)
+{
+    ESP_LOGI(TAG, "[状态机] 进入待机状态");
+
+    // 启动唤醒词监听
+    esp_err_t error = wake_word_start();
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "唤醒词启动失败：%s", esp_err_to_name(error));
+    }
+
+    // 切换音频资源给唤醒词
+    audio_service_transfer(AUDIO_SERVICE_OWNER_AI_DIALOG, AUDIO_SERVICE_OWNER_WAKE_WORD);
+}
+
+static void on_ai_starting(void)
+{
+    ESP_LOGI(TAG, "[状态机] AI对话启动中");
+
+    // 停止唤醒词监听
+    wake_word_stop();
+
+    // 切换音频资源给AI对话
+    audio_service_transfer(AUDIO_SERVICE_OWNER_WAKE_WORD, AUDIO_SERVICE_OWNER_AI_DIALOG);
+
+    // 开始AI会话
+    s_ai_turn++;
+    esp_err_t error = ai_dialog_start_session();
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "AI会话启动失败：%s", esp_err_to_name(error));
+        device_state_send_event(EVENT_COZE_ERROR);
+        return;
+    }
+
+    // 开始新的对话轮次
+    error = coze_app_begin_turn(s_ai_turn);
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "Coze轮次启动失败：%s", esp_err_to_name(error));
+        device_state_send_event(EVENT_COZE_ERROR);
+        return;
+    }
+
+    // 播放提示音后发送AI_READY事件
+    device_state_send_event(EVENT_AI_READY);
+}
+
+static void on_ai_listening(void)
+{
+    ESP_LOGI(TAG, "[状态机] AI监听用户");
+    // AI对话层会自动处理PCM上传
+}
+
+static void on_ai_processing(void)
+{
+    ESP_LOGI(TAG, "[状态机] AI处理中");
+    // 用户停止说话，等待AI回复
+}
+
+static void on_ai_playing(void)
+{
+    ESP_LOGI(TAG, "[状态机] AI播放回复");
+    // AI对话层会自动处理音频播放
+}
+
+static void on_conversation_end(void)
+{
+    ESP_LOGI(TAG, "[状态机] 对话结束，返回待机");
+
+    // 停止AI会话
+    ai_dialog_stop_session("对话结束");
+
+    // 结束Coze轮次
+    coze_app_end_turn(s_ai_turn);
+
+    // 返回待机状态会自动启动唤醒词
+}
+
+static void on_voice_call_incoming(void)
+{
+    ESP_LOGI(TAG, "[状态机] 语音来电");
+
+    // 如果正在AI对话，先停止
+    if (ai_dialog_is_session_active()) {
+        ai_dialog_stop_session("来电打断");
+        coze_app_end_turn(s_ai_turn);
+    }
+
+    // 播放铃声
+    voice_call_ring("Unknown");
+
+    // 自动接听（简化处理）
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    device_state_send_event(EVENT_CALL_ACCEPTED);
+}
+
+static void on_voice_call_start(void)
+{
+    ESP_LOGI(TAG, "[状态机] 语音通话开始");
+
+    // 接听通话
+    voice_call_accept();
+
+    // 切换音频资源
+    audio_service_transfer(AUDIO_SERVICE_OWNER_WAKE_WORD, AUDIO_SERVICE_OWNER_AI_DIALOG);
+}
+
+static void on_voice_call_end(void)
+{
+    ESP_LOGI(TAG, "[状态机] 语音通话结束");
+
+    // 挂断通话
+    voice_call_hangup();
+
+    // 返回待机状态会自动恢复唤醒词
+}
+
+static void on_video_call_incoming(void)
+{
+    ESP_LOGI(TAG, "[状态机] 视频来电");
+
+    // 如果正在AI对话，先停止
+    if (ai_dialog_is_session_active()) {
+        ai_dialog_stop_session("视频来电打断");
+        coze_app_end_turn(s_ai_turn);
+    }
+
+    // 播放铃声
+    video_call_ring("Unknown");
+
+    // 自动接听（简化处理）
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    device_state_send_event(EVENT_CALL_ACCEPTED);
+}
+
+static void on_video_call_start(void)
+{
+    ESP_LOGI(TAG, "[状态机] 视频通话开始");
+
+    // 接听视频通话
+    video_call_accept();
+
+    // 切换音频资源
+    audio_service_transfer(AUDIO_SERVICE_OWNER_WAKE_WORD, AUDIO_SERVICE_OWNER_AI_DIALOG);
+}
+
+static void on_video_call_end(void)
+{
+    ESP_LOGI(TAG, "[状态机] 视频通话结束");
+
+    // 挂断视频通话
+    video_call_hangup();
+
+    // 返回待机状态会自动恢复唤醒词
+}
+
+static void on_error_recovery(void)
+{
+    ESP_LOGI(TAG, "[状态机] 错误恢复");
+
+    // 停止所有业务
+    if (ai_dialog_is_session_active()) {
+        ai_dialog_stop_session("错误恢复");
+    }
+    if (voice_call_is_active()) {
+        voice_call_hangup();
+    }
+    if (video_call_is_active()) {
+        video_call_hangup();
+    }
+
+    // 尝试重连Coze
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_err_t error = coze_app_reconnect();
+    if (error == ESP_OK) {
+        device_state_send_event(EVENT_RECOVERY_COMPLETE);
+    } else {
+        // 继续重试
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        device_state_send_event(EVENT_RECOVERY_COMPLETE);
+    }
+}
+
+static void on_state_changed(device_state_t old_state, device_state_t new_state)
+{
+    ESP_LOGI(TAG, "[状态变化] %s -> %s",
+             device_state_get_name(old_state),
+             device_state_get_name(new_state));
+
+    // TODO: 更新LED指示灯、UI等
+}
+
+// ========== WiFi事件处理 ==========
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "Wi-Fi已连接");
+        device_state_send_event(EVENT_WIFI_CONNECTED);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "获取IP地址");
+        device_state_send_event(EVENT_NETWORK_READY);
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi-Fi断开");
+        device_state_send_event(EVENT_NETWORK_LOST);
+    }
+}
+
+// ========== 主入口 ==========
+
 void app_main(void)
 {
+    ESP_LOGI(TAG, "========== 设备启动 - 完整架构版本 ==========");
+
+    // 初始化NVS
     app_initialize_nvs();
 
+    // 初始化事件循环
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // 初始化设备状态机
+    device_state_callbacks_t state_callbacks = {
+        .on_network_connecting = on_network_connecting,
+        .on_service_starting = on_service_starting,
+        .on_enter_idle = on_enter_idle,
+        .on_ai_starting = on_ai_starting,
+        .on_ai_listening = on_ai_listening,
+        .on_ai_processing = on_ai_processing,
+        .on_ai_playing = on_ai_playing,
+        .on_conversation_end = on_conversation_end,
+        .on_voice_call_incoming = on_voice_call_incoming,
+        .on_voice_call_start = on_voice_call_start,
+        .on_voice_call_end = on_voice_call_end,
+        .on_video_call_incoming = on_video_call_incoming,
+        .on_video_call_start = on_video_call_start,
+        .on_video_call_end = on_video_call_end,
+        .on_error_recovery = on_error_recovery,
+        .on_state_changed = on_state_changed,
+    };
+
+    if (!device_state_machine_init(&state_callbacks)) {
+        ESP_LOGE(TAG, "状态机初始化失败");
+        return;
+    }
+
+    // 注册Wi-Fi事件处理
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                &wifi_event_handler, NULL));
+
+    // 启动Wi-Fi配网
     esp_err_t error = p4_c5_wifi_start();
     if (error != ESP_OK) {
-        ESP_LOGE(TAG, "Wi-Fi 配网服务启动失败：%s", esp_err_to_name(error));
+        ESP_LOGE(TAG, "Wi-Fi启动失败：%s", esp_err_to_name(error));
         return;
     }
-    ESP_LOGI(TAG, "Wi-Fi 配网服务已启动");
 
-    /* 统一音频服务必须早于唤醒词和 AI 对话初始化，确保两者共享同一套
-     * ES8311/I2S 资源，并让音量配置在启动阶段一次性写入硬件。 */
+    // 初始化统一音频服务
     ESP_ERROR_CHECK(audio_service_init());
+
+    // 初始化唤醒词服务
     ESP_ERROR_CHECK(wake_word_register_callback(app_on_wake_word_event, NULL));
     ESP_ERROR_CHECK(wake_word_register_pcm_callback(app_on_capture_pcm, NULL));
-    ESP_ERROR_CHECK(ai_dialog_init());
-
     error = wake_word_init();
     if (error != ESP_OK) {
-        ESP_LOGE(TAG, "唤醒词服务初始化失败：%s", esp_err_to_name(error));
+        ESP_LOGE(TAG, "唤醒词初始化失败：%s", esp_err_to_name(error));
         return;
     }
 
-    error = wake_word_start();
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "唤醒词监听启动失败：%s", esp_err_to_name(error));
-        return;
-    }
+    // 初始化通话组件
+    voice_call_config_t voice_config = {
+        .on_event = app_on_voice_call_event,
+        .context = NULL,
+    };
+    ESP_ERROR_CHECK(voice_call_init(&voice_config));
 
-    ESP_LOGI(TAG, "系统启动完成：待机监听 -> Coze 直连 AI 对话");
+    video_call_config_t video_config = {
+        .on_event = app_on_video_call_event,
+        .context = NULL,
+    };
+    ESP_ERROR_CHECK(video_call_init(&video_config));
+
+    ESP_LOGI(TAG, "========== 初始化完成，当前状态: %s ==========",
+             device_state_get_name(device_state_get_current()));
+
+    // Wi-Fi连接后会自动触发状态转换
+    // BOOT -> NETWORK_CONNECTING -> SERVICE_STARTING -> IDLE
 }

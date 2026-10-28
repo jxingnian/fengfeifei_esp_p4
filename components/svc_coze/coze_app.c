@@ -104,8 +104,10 @@ static void coze_app_event_callback(
     (void)context;
     switch (event) {
     case ESP_COZE_CHAT_EVENT_CHAT_COMPLETED:
-        coze_app_emit(COZE_APP_EVENT_AUDIO_END, NULL, 0, s_sequence);
-        s_audio_started = false;
+        if (s_audio_started) {
+            coze_app_emit(COZE_APP_EVENT_AUDIO_END, NULL, 0, s_sequence);
+            s_audio_started = false;
+        }
         break;
 
     case ESP_COZE_CHAT_EVENT_CHAT_ERROR:
@@ -187,28 +189,53 @@ esp_err_t coze_app_init(const coze_app_config_t *config)
     return ESP_OK;
 }
 
-esp_err_t coze_app_start(void)
+esp_err_t coze_app_connect(void)
 {
     if (!s_initialized || s_chat == NULL) {
+        ESP_LOGE(TAG, "Coze未初始化");
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_connected) {
+        ESP_LOGW(TAG, "Coze已连接");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "开始连接Coze服务...");
     esp_err_t error = esp_coze_chat_start(s_chat);
     if (error != ESP_OK) {
+        ESP_LOGE(TAG, "Coze连接失败：%s", esp_err_to_name(error));
         s_connected = false;
         s_ready = false;
         coze_app_emit(COZE_APP_EVENT_ERROR, NULL, 0, 0);
         return error;
     }
+
     s_connected = true;
     s_ready = true;
+    ESP_LOGI(TAG, "Coze服务已连接并就绪");
+    coze_app_emit(COZE_APP_EVENT_CONNECTED, NULL, 0, 0);
+    coze_app_emit(COZE_APP_EVENT_READY, NULL, 0, 0);
     return ESP_OK;
+}
+
+esp_err_t coze_app_reconnect(void)
+{
+    ESP_LOGI(TAG, "重连Coze服务");
+    if (s_connected) {
+        coze_app_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    return coze_app_connect();
 }
 
 esp_err_t coze_app_begin_turn(unsigned turn)
 {
     if (!s_initialized || !s_ready) {
+        ESP_LOGE(TAG, "Coze未就绪，无法开始对话");
         return ESP_ERR_INVALID_STATE;
     }
+
+    ESP_LOGI(TAG, "开始新对话轮次：turn=%u", turn);
     s_turn = turn;
     s_sequence = 0;
     s_audio_started = false;
@@ -239,15 +266,51 @@ esp_err_t coze_app_cancel(unsigned turn)
     return esp_coze_chat_send_audio_cancel(s_chat);
 }
 
-void coze_app_stop(void)
+esp_err_t coze_app_end_turn(unsigned turn)
+{
+    if (!s_initialized || !s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (turn != s_turn) {
+        ESP_LOGW(TAG, "结束轮次不匹配：期望%u，实际%u", s_turn, turn);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "结束对话轮次：turn=%u", turn);
+    s_audio_started = false;
+    coze_app_emit(COZE_APP_EVENT_TURN_END, NULL, 0, 0);
+    return ESP_OK;
+}
+
+void coze_app_disconnect(void)
 {
     if (!s_initialized || s_chat == NULL) {
         return;
     }
+
+    ESP_LOGI(TAG, "断开Coze连接");
     (void)esp_coze_chat_stop(s_chat);
     s_connected = false;
     s_ready = false;
     s_audio_started = false;
+}
+
+void coze_app_deinit(void)
+{
+    if (!s_initialized) {
+        return;
+    }
+
+    coze_app_disconnect();
+
+    if (s_chat) {
+        esp_coze_chat_deinit(s_chat);
+        s_chat = NULL;
+    }
+
+    memset(&s_config, 0, sizeof(s_config));
+    s_initialized = false;
+    ESP_LOGI(TAG, "Coze应用已反初始化");
 }
 
 void coze_app_playback_progress(unsigned turn, unsigned sequence)
@@ -262,9 +325,9 @@ bool coze_app_is_ready(void)
     return s_ready;
 }
 
-bool coze_app_connection_is_alive(void)
+bool coze_app_is_connected(void)
 {
-    return s_ready && s_connected;
+    return s_connected && s_ready;
 }
 
 esp_err_t coze_app_get_audio_config(coze_app_audio_config_t *config)

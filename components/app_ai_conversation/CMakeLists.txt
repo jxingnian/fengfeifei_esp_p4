@@ -5,9 +5,9 @@ idf_component_register(
     INCLUDE_DIRS
         "."
     REQUIRES
-        audio_service
-        coze_app
-        wake_word
+        svc_audio
+        svc_coze
+        app_wake_detection
         cjson
         freertos
         esp_timer

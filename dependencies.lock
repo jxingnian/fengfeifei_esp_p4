@@ -640,6 +640,6 @@ direct_dependencies:
 - idf
 - lvgl/lvgl
 - waveshare/esp_lcd_jd9365
-manifest_hash: f9ddbcb8629fd106010bace29b7cc7b116342a1e85dffc76b87deeaaa11cf0f9
+manifest_hash: 72091e8ac1dc7e5e6b9d55687dfd605d3c1ec35b0d04028c87a18393e6ccf11b
 target: esp32p4
 version: 3.0.0

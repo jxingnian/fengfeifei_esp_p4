@@ -7,9 +7,12 @@ idf_component_register(
         esp_event
         nvs_flash
     REQUIRES
-        wifi_provisioning
-        audio_service
-        wake_word
-        ai_dialog
-        video_uplink
+        device_state_machine
+        svc_wifi_provisioning
+        svc_audio
+        app_wake_detection
+        app_ai_conversation
+        svc_coze
+        app_voice_call
+        app_video_call
 )

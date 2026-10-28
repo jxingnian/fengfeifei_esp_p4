@@ -8,6 +8,9 @@ set_property(
     "${CMAKE_COMMAND} -E env PYTHONUTF8=1"
 )
 
+# 添加core目录到组件搜索路径
+set(EXTRA_COMPONENT_DIRS "core")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(p4_c5_ai_device)
 

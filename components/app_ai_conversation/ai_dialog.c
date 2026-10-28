@@ -61,6 +61,10 @@ typedef struct {
     unsigned seq;
 } opus_packet_desc_t;
 static const char *TAG = "ai_dialog";
+
+// 新架构：保存事件回调配置
+static ai_dialog_config_t s_event_config;
+
 static QueueHandle_t s_control_queue, s_encode_queue, s_pcm_queue;
 static SemaphoreHandle_t s_control_mutex, s_encoder_mutex, s_pcm_mutex, s_output_mutex, s_capture_mutex;
 static SemaphoreHandle_t s_opus_mutex, s_opus_data_sem;
@@ -91,6 +95,23 @@ static size_t s_opus_write_desc;
 static size_t s_opus_read_desc;
 static size_t s_opus_desc_count;
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+
+/**
+ * @brief 向状态机上报AI对话事件
+ */
+static void emit_ai_event(ai_dialog_event_type_t type, const char *message)
+{
+    if (s_event_config.on_event == NULL) {
+        return;
+    }
+
+    ai_dialog_event_t event = {
+        .type = type,
+        .message = message,
+    };
+    s_event_config.on_event(&event, s_event_config.context);
+}
+
 static unsigned json_uint(cJSON *root, const char *key)
 {
     cJSON *v = cJSON_GetObjectItemCaseSensitive(root, key);
@@ -405,7 +426,7 @@ static void finish(const char *reason, bool notify, bool restore)
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
     xSemaphoreTake(s_pcm_mutex, portMAX_DELAY);
     xSemaphoreTake(s_output_mutex, portMAX_DELAY);
-    coze_app_stop();
+    coze_app_end_turn(atomic_load(&s_turn));
     opus_ring_clear();
     clear_pcm();
     if (s_decoder != NULL) {
@@ -630,6 +651,13 @@ static void process_text(packet_t *packet)
  * Coze 回调运行在 WebSocket 任务中，不能在回调里执行状态迁移、编解码或
  * 播放。这里仅复制数据并零等待入队，所有后续动作由应用控制任务串行处理。
  */
+/**
+ * @brief 处理Coze事件（已移除，由app_main统一处理）
+ *
+ * 注意：在新架构中，Coze事件由app_main.c中的app_on_coze_event统一处理，
+ * 然后通过状态机分发到各个业务模块。这里保留函数定义以兼容旧代码。
+ */
+#if 0  // 禁用此函数，不再使用
 static void on_coze_event(const coze_app_event_t *event, void *context)
 {
     (void)context;
@@ -695,6 +723,8 @@ static void on_coze_event(const coze_app_event_t *event, void *context)
         atomic_store(&s_failure, 4);
     }
 }
+#endif  // 结束 #if 0
+
 static bool capture_current(capture_t *frame)
 {
     return frame->generation == atomic_load(&s_generation) && atomic_load(&s_ready) &&
@@ -1058,7 +1088,7 @@ static void ai_dialog_worker(void *arg)
                 ai_dialog_logic_reset();
                 ESP_LOGE(TAG, "唤醒后切换 AI 对话音频所有权失败：%s",
                          esp_err_to_name(conversation_error));
-            } else if (atomic_load(&s_ready) && coze_app_start() == ESP_OK) {
+            } else if (atomic_load(&s_ready) && coze_app_is_connected()) {
                 /* 播放唤醒提示音 */
                 play_wake_alert_sound();
 
@@ -1077,7 +1107,7 @@ static void ai_dialog_worker(void *arg)
         unsigned failure = atomic_exchange(&s_failure, 0);
         if (failure && ai_dialog_logic_is_session_active()) finish(failure == 2 ? "no speech" : "audio pipeline failure", true, true);
         if (ai_dialog_logic_is_session_active()) {
-            if (!coze_app_connection_is_alive()) {
+            if (!coze_app_is_connected()) {
                 atomic_store(&s_ready, false);
                 (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_BACKEND_STOPPED);
                 finish("connection lost", false, true);
@@ -1126,9 +1156,19 @@ static void ai_dialog_worker(void *arg)
         xSemaphoreGive(s_control_mutex); vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
-esp_err_t ai_dialog_init(void)
+esp_err_t ai_dialog_init(const ai_dialog_config_t *config)
 {
+    // 新架构：验证配置参数
+    if (config == NULL || config->on_event == NULL) {
+        ESP_LOGE(TAG, "ai_dialog_init: 配置参数不能为空");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (atomic_load(&s_initialized)) return ESP_ERR_INVALID_STATE;
+
+    // 保存事件回调配置
+    s_event_config = *config;
+
     if (ai_dialog_logic_init() != ESP_OK) return ESP_FAIL;
     s_control_queue = xQueueCreate(CONTROL_QUEUE_LENGTH, sizeof(packet_t));
     s_encode_queue = xQueueCreateWithCaps(ENCODE_QUEUE_LENGTH, sizeof(capture_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1142,11 +1182,14 @@ esp_err_t ai_dialog_init(void)
         !s_encoder_mutex || !s_pcm_mutex || !s_output_mutex || !s_opus_mutex || !s_opus_data_sem ||
         !s_vad ||
         opus_ring_init() != ESP_OK) goto fail;
-    coze_app_config_t coze_config = {
-        .on_event = on_coze_event,
-        .context = NULL,
-    };
-    if (coze_app_init(&coze_config) != ESP_OK) goto fail;
+
+    // 新架构：coze_app已在app_main的on_service_starting中初始化，这里不再初始化
+    // 只获取音频配置
+    coze_app_audio_config_t audio_config;
+    if (coze_app_get_audio_config(&audio_config) != ESP_OK) {
+        ESP_LOGE(TAG, "无法获取Coze音频配置");
+        goto fail;
+    }
 
     /* 仅在配置开启时注册播放期间的 VAD打断回调。 */
 #if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
@@ -1156,9 +1199,6 @@ esp_err_t ai_dialog_init(void)
     }
 #endif
 
-    /* Coze 直连没有后台 ready 消息，启动时直接应用 Coze 组件声明的格式。 */
-    coze_app_audio_config_t audio_config;
-    if (coze_app_get_audio_config(&audio_config) != ESP_OK) goto fail;
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
     xSemaphoreTake(s_pcm_mutex, portMAX_DELAY);
     bool codec_ok = open_codecs(&audio_config);
@@ -1197,6 +1237,43 @@ void ai_dialog_on_wake_detected(void)
 {
     if (atomic_load(&s_initialized)) atomic_store(&s_wake_requested, true);
 }
+
+esp_err_t ai_dialog_start_session(void)
+{
+    if (!atomic_load(&s_initialized)) {
+        ESP_LOGE(TAG, "AI对话服务未初始化");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "开始AI对话会话");
+
+    // 触发唤醒请求
+    atomic_store(&s_wake_requested, true);
+
+    // 向状态机上报AI就绪事件
+    emit_ai_event(AI_DIALOG_EVENT_READY, NULL);
+
+    return ESP_OK;
+}
+
+void ai_dialog_deinit(void)
+{
+    if (!atomic_load(&s_initialized)) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "反初始化AI对话服务");
+
+    // 停止当前会话
+    ai_dialog_stop_session("反初始化");
+
+    // TODO: 停止所有任务、释放资源
+    // 当前保持简化实现，避免影响现有逻辑
+
+    atomic_store(&s_initialized, false);
+    ESP_LOGI(TAG, "AI对话服务已反初始化");
+}
+
 void ai_dialog_on_pcm(const int16_t *samples, size_t count, void *context)
 {
     (void)context;
@@ -1223,11 +1300,12 @@ void ai_dialog_on_pcm(const int16_t *samples, size_t count, void *context)
     }
     xSemaphoreGive(s_capture_mutex);
 }
-void ai_dialog_stop_session(const char *reason)
+esp_err_t ai_dialog_stop_session(const char *reason)
 {
-    if (!atomic_load(&s_initialized)) return;
+    if (!atomic_load(&s_initialized)) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
     finish(reason ? reason : "external stop", true, false);
     xSemaphoreGive(s_control_mutex);
+    return ESP_OK;
 }
 bool ai_dialog_is_session_active(void) { return ai_dialog_logic_is_session_active(); }

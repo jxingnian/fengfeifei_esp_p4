@@ -5,7 +5,7 @@ idf_component_register(
         "."
     REQUIRES
         esp-sr
-        audio_service
+        svc_audio
         freertos
         esp_timer
 )
