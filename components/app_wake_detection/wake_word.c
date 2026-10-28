@@ -424,39 +424,29 @@ esp_err_t wake_word_stop(void)
 esp_err_t wake_word_start_conversation(void)
 {
     /*
+     * 新架构：音频资源切换由设备状态机统一管理。
+     * 本函数只标记进入对话模式，不再执行音频所有权转移。
+     *
      * 播放打断功能要求采集任务在整个 AI 会话期间持续运行。
-     * 同一轮会话可能多次调用本函数，因此已经处于对话模式时必须保持幂等，
-     * 不能再次尝试把已经属于 AI_DIALOG 的音频所有权转移一次。
+     * 同一轮会话可能多次调用本函数，因此已经处于对话模式时必须保持幂等。
     */
     if (s_conversation_active) {
         return ESP_OK;
     }
 
-    /*
-     * 必须先完成音频服务所有权转移，再修改本地模式标志。否则采集任务会
-     * 按 AI_DIALOG 所有者读取音频，而统一音频服务仍然记录为 WAKE_WORD，
-     * 后续播放提示音和读取 PCM 都会返回 ESP_ERR_INVALID_STATE。
-     */
-    esp_err_t error = audio_service_transfer(
-        AUDIO_SERVICE_OWNER_WAKE_WORD,
-        AUDIO_SERVICE_OWNER_AI_DIALOG
-    );
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "切换到 AI 对话音频所有权失败：%s", esp_err_to_name(error));
-        return error;
-    }
-
+    ESP_LOGI(TAG, "进入AI对话模式（音频切换由状态机管理）");
     s_conversation_active = true;
     return ESP_OK;
 }
 
 void wake_word_stop_conversation(void)
 {
+    /*
+     * 新架构：音频资源切换由设备状态机统一管理。
+     * 本函数只标记退出对话模式，不再执行音频所有权转移。
+     */
+    ESP_LOGI(TAG, "退出AI对话模式（音频切换由状态机管理）");
     s_conversation_active = false;
-    (void)audio_service_transfer(
-        AUDIO_SERVICE_OWNER_AI_DIALOG,
-        AUDIO_SERVICE_OWNER_WAKE_WORD
-    );
 }
 
 bool wake_word_is_conversation_active(void)

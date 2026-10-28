@@ -582,12 +582,12 @@ static void play_wake_alert_sound(void)
 
 static bool begin_turn(void)
 {
-    esp_err_t conversation_error = wake_word_start_conversation();
-    if (conversation_error != ESP_OK) {
-        ESP_LOGE(TAG, "开始对话轮次失败，音频所有权未切换：%s",
-                 esp_err_to_name(conversation_error));
-        return false;
-    }
+    /*
+     * 新架构：音频资源切换由状态机统一管理。
+     * wake_word_start_conversation()现在只标记模式，不再切换音频。
+     */
+    (void)wake_word_start_conversation();
+
     reset_capture(); atomic_fetch_add(&s_turn, 1);
     atomic_store(&s_completed_seq, 0); atomic_store(&s_end_seen, false);
     atomic_store(&s_listen_since, now_ms());
@@ -1083,12 +1083,15 @@ static void ai_dialog_worker(void *arg)
              * 提示音使用 AI_DIALOG 所有者访问统一音频服务，因此必须在
              * 启动 Coze 和播放提示音之前完成 WAKE_WORD -> AI_DIALOG 转移。
              */
-            esp_err_t conversation_error = wake_word_start_conversation();
-            if (conversation_error != ESP_OK) {
-                ai_dialog_logic_reset();
-                ESP_LOGE(TAG, "唤醒后切换 AI 对话音频所有权失败：%s",
-                         esp_err_to_name(conversation_error));
-            } else if (atomic_load(&s_ready) && coze_app_is_connected()) {
+            /*
+             * 新架构：音频资源切换由状态机统一管理。
+             * wake_word_start_conversation()现在只标记模式，不再切换音频。
+             * 因此不再需要检查返回的错误。
+             */
+            (void)wake_word_start_conversation();
+
+            /* 启动Coze会话 */
+            if (atomic_load(&s_ready) && coze_app_is_connected()) {
                 /* 播放唤醒提示音 */
                 play_wake_alert_sound();
 
@@ -1250,8 +1253,8 @@ esp_err_t ai_dialog_start_session(void)
     // 触发唤醒请求
     atomic_store(&s_wake_requested, true);
 
-    // 向状态机上报AI就绪事件
-    emit_ai_event(AI_DIALOG_EVENT_READY, NULL);
+    // 注意：不在这里发送AI_DIALOG_EVENT_READY
+    // EVENT_AI_READY由app_main的状态机回调统一发送，避免重复
 
     return ESP_OK;
 }
