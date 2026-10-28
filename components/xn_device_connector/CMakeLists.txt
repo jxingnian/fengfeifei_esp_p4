@@ -6,5 +6,5 @@ idf_component_register(
          "xn_message_router.c"
          "xn_config_sync.c"
     INCLUDE_DIRS "include"
-    REQUIRES nvs_flash esp_http_client json
+    REQUIRES nvs_flash esp_http_client cjson
 )
