@@ -11,4 +11,5 @@ idf_component_register(
         audio_service
         wake_word
         ai_dialog
+        video_uplink
 )
