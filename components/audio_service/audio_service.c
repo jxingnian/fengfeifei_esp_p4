@@ -492,7 +492,12 @@ esp_err_t audio_service_write_pcm(
     if (samples == NULL || sample_count == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t error = audio_service_io_lock(owner);
+    /*
+     * 写入扬声器可能等待 DMA 空间。服务锁不能覆盖这个等待过程，
+     * 否则采集任务会在播放期间无法进入服务层并触发读取超时。
+     * 底层 audio_driver 使用独立的设备锁串行保护实际 codec 访问。
+     */
+    esp_err_t error = audio_service_check_owner(owner);
     if (error != ESP_OK) {
         return error;
     }
@@ -501,7 +506,6 @@ esp_err_t audio_service_write_pcm(
         /* 只有真正写入驱动的 PCM 才能作为扬声器回声参考。 */
         audio_service_push_reference(samples, sample_count);
     }
-    xSemaphoreGive(s_io_mutex);
     return error;
 }
 
@@ -521,12 +525,12 @@ esp_err_t audio_service_set_output_enabled(audio_service_owner_t owner, bool ena
 
 esp_err_t audio_service_drain(audio_service_owner_t owner)
 {
-    esp_err_t error = audio_service_io_lock(owner);
+    /* drain 内部会等待 DMA 播放完成，不能持有服务层公共 I/O 锁。 */
+    esp_err_t error = audio_service_check_owner(owner);
     if (error != ESP_OK) {
         return error;
     }
     error = audio_driver_drain();
-    xSemaphoreGive(s_io_mutex);
     return error;
 }
 
