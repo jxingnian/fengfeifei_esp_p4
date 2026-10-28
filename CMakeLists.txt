@@ -10,4 +10,8 @@ set_property(
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(p4_c5_ai_device)
+
+# 在 ESP-IDF 完成组件解析后应用兼容修复，避免组件管理器重新生成
+# managed_components 时覆盖修复内容。
+include("${CMAKE_SOURCE_DIR}/cmake/esp_idf_v6_1_compat.cmake")
 idf_build_set_property(MINIMAL_BUILD ON)

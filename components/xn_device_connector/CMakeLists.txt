@@ -6,5 +6,6 @@ idf_component_register(
          "xn_message_router.c"
          "xn_config_sync.c"
     INCLUDE_DIRS "include"
-    REQUIRES nvs_flash esp_http_client cjson
+    # 组件源码直接使用 WebSocket 客户端 API，必须显式声明公共依赖。
+    REQUIRES nvs_flash esp_http_client esp_websocket_client cjson
 )
