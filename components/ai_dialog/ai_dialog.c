@@ -47,12 +47,9 @@
 #define ALERT_DRIP_PCM_PEAK 16113
 
 /*
- * 播放打断检测使用 60 ms 的采集帧。连续两帧被本地 VAD 判定为语音后才
- * 触发打断，既能把响应延迟控制在约 120 ms，也能过滤单帧噪声和按键声。
+ * 播放打断检测已迁移到 audio_service 的统一 VAD，通过回调机制实现。
+ * 不再需要独立的打断 VAD 实例和前置缓冲区。
  */
-#define INTERRUPT_MIN_SPEECH_FRAMES 2U
-/* 播放期间保留 300 ms 前置语音，避免 VAD 判定完成前丢掉用户开头。 */
-#define INTERRUPT_PRE_ROLL_FRAMES PRE_ROLL_FRAMES
 
 typedef struct { unsigned generation; int16_t samples[FRAME_SAMPLES]; } capture_t;
 typedef struct { size_t length; uint8_t *data; unsigned turn, seq; } packet_t;
@@ -79,15 +76,10 @@ static unsigned s_end_sequence;
 static bool s_wait_warning, s_input_opus, s_server_vad;
 static capture_t s_capture_frame;
 static size_t s_captured;
-/* 这些数据只由麦克风采集回调在 s_capture_mutex 保护下读写。 */
-static capture_t s_interrupt_pre_roll[INTERRUPT_PRE_ROLL_FRAMES];
-static unsigned s_interrupt_pre_roll_count;
-static unsigned s_interrupt_speech_frames;
+/* 播放打断检测已迁移到 audio_service 的统一 VAD。 */
 static void *s_encoder;
 static void *s_decoder;
 static vad_handle_t s_vad;
-/* 播放打断检测独占一个 VAD 实例，避免与上行编码任务并发访问同一实例。 */
-static vad_handle_t s_interrupt_vad;
 static _Alignas(16) uint8_t s_encoded_buffer[MAX_PACKET];
 static capture_t s_pre_roll[PRE_ROLL_FRAMES]; /* encoder owns ring */
 static uint8_t *s_opus_ring;
@@ -365,76 +357,29 @@ static void reset_capture(void)
  * 该函数只清除检测计数，不清除前置 PCM；前置 PCM 会在真正开始新 turn
  * 时重新送入编码队列，保证用户第一句话的开头不会丢失。
  */
-static void reset_interrupt_detector(void)
-{
-    s_interrupt_pre_roll_count = 0;
-    s_interrupt_speech_frames = 0;
-    if (s_interrupt_vad != NULL) {
-        vad_reset_trigger(s_interrupt_vad);
-    }
-}
-
 /**
- * @brief 判断一帧播放期间采集到的 PCM 是否包含稳定人声。
+ * @brief VAD 状态变化回调函数。
  *
- * 麦克风 PCM 在 audio_service 中已经经过 ESP-SR AEC，当前这里只判断
- * AEC 输出中的连续人声，不再使用上一版没有依据的原始音量门限。
+ * 当 audio_service 检测到 VAD 状态变化时调用。
+ * 播放期间检测到语音会触发打断。
  */
-static bool interrupt_frame_is_speech(int16_t *samples, size_t count)
+static void on_vad_state_change(bool speaking, void *context)
 {
-    if (samples == NULL || count < 320U || s_interrupt_vad == NULL) {
-        return false;
-    }
+    (void)context;
 
-    unsigned speech_count = 0;
-
-    for (size_t offset = 0; offset + 320U <= count; offset += 320U) {
-        if (vad_process(s_interrupt_vad, samples + offset, 16000, 20) == VAD_SPEECH) {
-            speech_count++;
-        }
-    }
-
-    return speech_count >= 2U;
-}
-
-/**
- * @brief 在播放状态下记录采集帧并请求中断。
- *
- * 麦克风回调运行在采集任务中，只允许做固定时间的内存复制和 VAD 计算，
- * 不在这里调用 Coze、操作队列或关闭扬声器；真正的清理由控制任务完成。
- */
-static void inspect_playback_capture(int16_t *samples, size_t count)
-{
-    if (samples == NULL || count != FRAME_SAMPLES) {
+    /* 只在播放期间才处理 VAD 事件 */
+    if (!playing()) {
         return;
     }
 
-    if (s_interrupt_pre_roll_count < INTERRUPT_PRE_ROLL_FRAMES) {
-        s_interrupt_pre_roll[s_interrupt_pre_roll_count].generation = atomic_load(&s_generation);
-        memcpy(s_interrupt_pre_roll[s_interrupt_pre_roll_count].samples,
-               samples,
-               sizeof(s_interrupt_pre_roll[0].samples));
-        s_interrupt_pre_roll_count++;
-    } else {
-        memmove(&s_interrupt_pre_roll[0],
-                &s_interrupt_pre_roll[1],
-                sizeof(s_interrupt_pre_roll[0]) * (INTERRUPT_PRE_ROLL_FRAMES - 1U));
-        s_interrupt_pre_roll[INTERRUPT_PRE_ROLL_FRAMES - 1U].generation = atomic_load(&s_generation);
-        memcpy(s_interrupt_pre_roll[INTERRUPT_PRE_ROLL_FRAMES - 1U].samples,
-               samples,
-               sizeof(s_interrupt_pre_roll[0].samples));
-    }
-
-    if (interrupt_frame_is_speech(samples, count)) {
-        s_interrupt_speech_frames++;
-    } else {
-        s_interrupt_speech_frames = 0;
-    }
-
-    if (s_interrupt_speech_frames >= INTERRUPT_MIN_SPEECH_FRAMES) {
+    /* 检测到语音开始，触发打断 */
+    if (speaking) {
+        ESP_LOGI(TAG, "turn=%u VAD detected speech during playback, requesting interrupt",
+                 atomic_load(&s_turn));
         atomic_store(&s_interrupt_requested, true);
     }
 }
+
 static void acknowledge(unsigned turn, unsigned seq)
 {
     coze_app_playback_progress(turn, seq);
@@ -467,6 +412,8 @@ static void finish(const char *reason, bool notify, bool restore)
         AUDIO_SERVICE_OWNER_AI_DIALOG,
         false
     );
+    /* 禁用 VAD 打断检测 */
+    (void)audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, false);
     xSemaphoreGive(s_output_mutex); xSemaphoreGive(s_pcm_mutex); xSemaphoreGive(s_encoder_mutex);
     atomic_store(&s_failure, 0);
     wake_word_stop_conversation(); atomic_store(&s_end_seen, false);
@@ -664,11 +611,8 @@ static void process_text(packet_t *packet)
              (s_server_vad && ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING))) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
 
-            /* 每次新回复开始时重新建立播放期前置缓冲和独立 VAD 的状态。 */
-            xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
-            reset_interrupt_detector();
-            s_captured = 0;
-            xSemaphoreGive(s_capture_mutex);
+            /* 启用 audio_service 的统一 VAD 用于播放期打断检测 */
+            audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
 
             /* server_vad 模式下扬声器已在 speech_stopped 提前启用；非 server_vad 模式在此启用 */
             if (!s_server_vad) {
@@ -1092,31 +1036,10 @@ static void try_drain(void)
 }
 
 /**
- * @brief 把播放打断前保存的 300 ms 语音前置帧送入新一轮编码队列。
- *
- * 该函数必须在 begin_turn() 之后调用，因为 begin_turn() 会递增 generation
- * 并清空旧的上行队列；重新写入新的 generation 后，旧回复数据不会混入新轮次。
- */
-static void enqueue_interrupt_pre_roll(void)
-{
-    xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
-    const unsigned generation = atomic_load(&s_generation);
-    for (unsigned i = 0; i < s_interrupt_pre_roll_count; ++i) {
-        capture_t frame = s_interrupt_pre_roll[i];
-        frame.generation = generation;
-        if (xQueueSend(s_encode_queue, &frame, 0) != pdTRUE) {
-            atomic_fetch_add(&s_capture_drops, 1);
-        }
-    }
-    reset_interrupt_detector();
-    xSemaphoreGive(s_capture_mutex);
-}
-
-/**
  * @brief 中断当前 AI 回复，但不关闭 Coze WebSocket。
  *
  * 播放打断和异常结束是两条不同的生命周期：异常结束可以关闭会话，
- * 播放打断必须保留长连接，并把用户已经说出的前置语音送入下一轮 turn。
+ * 播放打断必须保留长连接，立即开始新一轮对话。
  */
 static void interrupt_playback(void)
 {
@@ -1139,6 +1062,8 @@ static void interrupt_playback(void)
         AUDIO_SERVICE_OWNER_AI_DIALOG,
         false
     );
+    /* 禁用 VAD 打断检测 */
+    (void)audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, false);
     atomic_store(&s_end_seen, false);
     xSemaphoreGive(s_output_mutex);
     xSemaphoreGive(s_pcm_mutex);
@@ -1159,7 +1084,6 @@ static void interrupt_playback(void)
         atomic_store(&s_failure, 1);
         return;
     }
-    enqueue_interrupt_pre_roll();
     ESP_LOGI(TAG, "turn=%u 播放已停止，已进入新的用户语音输入轮次", atomic_load(&s_turn));
 }
 static void ai_dialog_worker(void *arg)
@@ -1268,17 +1192,22 @@ esp_err_t ai_dialog_init(void)
     s_encoder_mutex = xSemaphoreCreateMutex(); s_pcm_mutex = xSemaphoreCreateMutex(); s_output_mutex = xSemaphoreCreateMutex();
     s_opus_mutex = xSemaphoreCreateMutex(); s_opus_data_sem = xSemaphoreCreateBinary();
     s_vad = vad_create((vad_mode_t)CONFIG_AI_DIALOG_VAD_MODE);
-    s_interrupt_vad = vad_create((vad_mode_t)CONFIG_AI_DIALOG_VAD_MODE);
     TaskHandle_t tasks[4] = {0};
     if (!s_control_queue || !s_encode_queue || !s_pcm_queue || !s_control_mutex || !s_capture_mutex ||
         !s_encoder_mutex || !s_pcm_mutex || !s_output_mutex || !s_opus_mutex || !s_opus_data_sem ||
-        !s_vad || !s_interrupt_vad ||
+        !s_vad ||
         opus_ring_init() != ESP_OK) goto fail;
     coze_app_config_t coze_config = {
         .on_event = on_coze_event,
         .context = NULL,
     };
     if (coze_app_init(&coze_config) != ESP_OK) goto fail;
+
+    /* 注册 audio_service 的 VAD 回调用于播放打断检测 */
+    if (audio_service_set_vad_callback(on_vad_state_change, NULL) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register VAD callback");
+        goto fail;
+    }
 
     /* Coze 直连没有后台 ready 消息，启动时直接应用 Coze 组件声明的格式。 */
     coze_app_audio_config_t audio_config;
@@ -1296,13 +1225,14 @@ esp_err_t ai_dialog_init(void)
         xTaskCreate(ai_dialog_decode_worker, "ai_dialog_pcm", AI_DIALOG_WORKER_STACK_BYTES, NULL, 4, &tasks[1]) != pdPASS ||
         xTaskCreate(ai_dialog_output_worker, "voice_ai_out", 6144, NULL, 5, &tasks[2]) != pdPASS ||
         xTaskCreate(ai_dialog_worker, "voice_ai_ctl", 8192, NULL, 5, &tasks[3]) != pdPASS) goto fail;
-    atomic_store(&s_initialized, true); return ESP_OK;
+    atomic_store(&s_initialized, true);
+    ESP_LOGI(TAG, "AI dialog initialized with unified VAD interrupt detection");
+    return ESP_OK;
 fail:
     for (unsigned i = 0; i < 4; ++i) if (tasks[i]) vTaskDelete(tasks[i]);
     if (s_decoder) { (void)esp_opus_dec_close(s_decoder); s_decoder = NULL; }
     if (s_encoder) { esp_opus_enc_close(s_encoder); s_encoder = NULL; }
     if (s_vad) vad_destroy(s_vad);
-    if (s_interrupt_vad) vad_destroy(s_interrupt_vad);
     opus_ring_deinit();
     QueueHandle_t queues[] = {s_control_queue, s_pcm_queue};
     for (unsigned i = 0; i < 2; ++i) if (queues[i]) vQueueDelete(queues[i]);
@@ -1320,30 +1250,11 @@ void ai_dialog_on_pcm(const int16_t *samples, size_t count, void *context)
     (void)context;
     if (!samples || !count || !atomic_load(&s_initialized)) return;
     const bool capture_allowed = ai_dialog_logic_can_capture();
-    const bool playback_active = playing();
-    if (!capture_allowed && !playback_active) return;
+    if (!capture_allowed) return;
     atomic_fetch_add(&s_produced_samples, count);
     if (xSemaphoreTake(s_capture_mutex, 0) != pdTRUE) { atomic_fetch_add(&s_capture_drops, 1); return; }
-    if (playback_active && !ai_dialog_logic_can_capture()) {
-        /*
-         * 播放期间不把麦克风数据送入正常上行队列，避免用户尚未确认说话
-         * 时污染当前 turn；只拼成 60 ms 帧交给本地打断检测器。
-         */
-        while (count) {
-            size_t n = FRAME_SAMPLES - s_captured;
-            if (n > count) n = count;
-            memcpy(s_capture_frame.samples + s_captured, samples, n * sizeof(int16_t));
-            samples += n;
-            count -= n;
-            s_captured += n;
-            if (s_captured == FRAME_SAMPLES) {
-                inspect_playback_capture(s_capture_frame.samples, FRAME_SAMPLES);
-                s_captured = 0;
-            }
-        }
-        xSemaphoreGive(s_capture_mutex);
-        return;
-    }
+
+    /* 播放期间的打断检测已由 audio_service 的统一 VAD 处理，这里只处理正常录音 */
     if (ai_dialog_logic_can_capture()) {
         while (count) {
             size_t n = FRAME_SAMPLES - s_captured; if (n > count) n = count;

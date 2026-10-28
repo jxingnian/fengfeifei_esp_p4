@@ -125,6 +125,38 @@ esp_err_t audio_service_set_output_enabled(
  */
 esp_err_t audio_service_drain(audio_service_owner_t owner);
 
+/**
+ * @brief VAD 状态变化回调函数类型。
+ *
+ * @param speaking true=检测到语音，false=静音
+ * @param context 用户上下文指针
+ */
+typedef void (*audio_service_vad_callback_t)(bool speaking, void *context);
+
+/**
+ * @brief 设置 VAD 状态变化回调。
+ *
+ * @param callback 回调函数，NULL 表示取消注册
+ * @param context 用户上下文，会在回调时传回
+ * @return ESP_OK 成功
+ */
+esp_err_t audio_service_set_vad_callback(
+    audio_service_vad_callback_t callback,
+    void *context
+);
+
+/**
+ * @brief 启用/禁用 VAD 检测。
+ *
+ * @param owner 调用者身份
+ * @param enabled true=启用，false=禁用
+ * @return ESP_OK 成功
+ */
+esp_err_t audio_service_enable_vad(
+    audio_service_owner_t owner,
+    bool enabled
+);
+
 #ifdef __cplusplus
 }
 #endif

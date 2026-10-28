@@ -12,6 +12,7 @@
 #include "esp_afe_aec.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_vad.h"
 #include "freertos/semphr.h"
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,11 @@ static size_t s_aec_pending_samples;
 static size_t s_reference_read;
 static size_t s_reference_write;
 static size_t s_reference_count;
+static audio_service_vad_callback_t s_vad_callback;
+static void *s_vad_callback_context;
+static bool s_vad_enabled;
+static bool s_is_speaking;
+static vad_handle_t s_vad;
 
 /**
  * @brief 清空扬声器播放参考环形缓冲区。
@@ -134,6 +140,19 @@ static esp_err_t audio_service_init_aec(void)
         return ESP_ERR_NO_MEM;
     }
     audio_service_clear_reference();
+
+    /* 创建 VAD 实例用于统一语音检测 */
+    s_vad = vad_create(VAD_MODE_0);
+    if (s_vad == NULL) {
+        ESP_LOGE(TAG, "Failed to create VAD instance");
+        return ESP_ERR_NO_MEM;
+    }
+    s_vad_enabled = false;
+    s_is_speaking = false;
+    s_vad_callback = NULL;
+    s_vad_callback_context = NULL;
+
+    ESP_LOGI(TAG, "AEC and VAD initialized successfully");
     return ESP_OK;
 }
 
@@ -145,6 +164,10 @@ static void audio_service_deinit_aec(void)
     if (s_aec != NULL) {
         afe_aec_destroy(s_aec);
         s_aec = NULL;
+    }
+    if (s_vad != NULL) {
+        vad_destroy(s_vad);
+        s_vad = NULL;
     }
     /* 对齐分配的内存使用 ESP-IDF 推荐的通用能力内存释放接口。 */
     heap_caps_free(s_aec_input);
@@ -187,7 +210,12 @@ static esp_err_t audio_service_io_lock(audio_service_owner_t owner)
     if (error != ESP_OK) {
         return error;
     }
-    if (xSemaphoreTake(s_io_mutex, portMAX_DELAY) != pdTRUE) {
+    /*
+     * 音频 I/O 锁只保护服务层共享状态和一次底层操作的配置切换。
+     * 采集函数不能在持有该锁时等待 I2S/DMA，否则播放任务无法切换扬声器。
+     * 使用有限等待可以把异常锁占用转换为明确的超时错误，避免控制任务永久卡死。
+     */
+    if (xSemaphoreTake(s_io_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
@@ -366,10 +394,30 @@ esp_err_t audio_service_read_pcm(
     if (samples == NULL || sample_count == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    esp_err_t error = audio_service_io_lock(owner);
+    /*
+     * 这里只短暂检查所有权并读取服务配置，不能使用 audio_service_io_lock()
+     * 把锁一直保持到函数结束。audio_driver_read() 会等待硬件 DMA 完成，
+     * 期间必须允许播放控制任务获取服务锁并切换扬声器输出。
+     */
+    esp_err_t error = audio_service_check_owner(owner);
     if (error != ESP_OK) {
         return error;
     }
+
+    if (xSemaphoreTake(s_io_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /*
+     * 采集循环由单独的采集任务串行执行；这里仅复制 VAD 配置和回调，
+     * 释放服务锁后再执行硬件读取和 VAD 运算，避免 DMA 或回调阻塞其他音频操作。
+     */
+    const bool vad_enabled = s_vad_enabled;
+    vad_handle_t vad = s_vad;
+    audio_service_vad_callback_t vad_callback = s_vad_callback;
+    void *vad_callback_context = s_vad_callback_context;
+    xSemaphoreGive(s_io_mutex);
+
     size_t produced = 0;
     while (produced < sample_count) {
         /* 先消费上一次 AEC 帧未被调用方取完的净化 PCM。 */
@@ -405,9 +453,33 @@ esp_err_t audio_service_read_pcm(
             error = ESP_FAIL;
             break;
         }
+
+        /* VAD 检测：对 AEC 处理后的音频进行语音活动检测 */
+        if (vad_enabled && vad != NULL && vad_callback != NULL) {
+            /* VAD 以 20ms 为单位处理，每帧需要 320 个样本 (16kHz * 0.02s) */
+            unsigned speech_count = 0;
+            unsigned total_chunks = 0;
+            for (size_t offset = 0; offset + 320U <= s_aec_frame_samples; offset += 320U) {
+                vad_state_t vad_state = vad_process(vad, s_aec_output + offset, 16000, 20);
+                total_chunks++;
+                if (vad_state == VAD_SPEECH) {
+                    speech_count++;
+                }
+            }
+
+            /* 判断当前帧是否为语音：要求至少2/3的块为语音 */
+            bool speaking = (total_chunks > 0 && speech_count * 3 >= total_chunks * 2);
+
+            /* 状态变化时触发回调 */
+            if (speaking != s_is_speaking) {
+                s_is_speaking = speaking;
+                /* 回调不在 s_io_mutex 内执行，避免回调链形成锁重入。 */
+                vad_callback(speaking, vad_callback_context);
+            }
+        }
+
         s_aec_pending_samples = s_aec_frame_samples;
     }
-    xSemaphoreGive(s_io_mutex);
     return error;
 }
 
@@ -456,4 +528,51 @@ esp_err_t audio_service_drain(audio_service_owner_t owner)
     error = audio_driver_drain();
     xSemaphoreGive(s_io_mutex);
     return error;
+}
+
+esp_err_t audio_service_set_vad_callback(
+    audio_service_vad_callback_t callback,
+    void *context
+)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+    s_vad_callback = callback;
+    s_vad_callback_context = context;
+    xSemaphoreGive(s_io_mutex);
+
+    return ESP_OK;
+}
+
+esp_err_t audio_service_enable_vad(
+    audio_service_owner_t owner,
+    bool enabled
+)
+{
+    if (!s_initialized || !audio_service_valid_owner(owner)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_owner_mutex, portMAX_DELAY);
+    if (s_owner != owner) {
+        xSemaphoreGive(s_owner_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreGive(s_owner_mutex);
+
+    xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+    s_vad_enabled = enabled;
+    s_is_speaking = false;
+
+    if (s_vad != NULL && enabled) {
+        vad_reset_trigger(s_vad);
+    }
+
+    xSemaphoreGive(s_io_mutex);
+
+    ESP_LOGI(TAG, "VAD %s", enabled ? "enabled" : "disabled");
+    return ESP_OK;
 }
