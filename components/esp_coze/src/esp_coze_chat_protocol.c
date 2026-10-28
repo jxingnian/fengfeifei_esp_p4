@@ -149,8 +149,6 @@ static cJSON *build_event_subscriptions(coze_chat_t *chat)
     static const char *defaults[] = {
         "conversation.audio.delta",
         "conversation.chat.completed",
-        "input_audio_buffer.speech_started",
-        "input_audio_buffer.speech_stopped",
         "conversation.chat.requires_action",
         "chat.created",
         "error",
@@ -263,22 +261,6 @@ esp_err_t esp_coze_proto_send_update(coze_chat_t *chat)
     cJSON_AddItemToObject(data, "input_audio", input_audio);
     cJSON_AddItemToObject(data, "output_audio", output_audio);
 
-    if (chat->config.mode == ESP_COZE_CHAT_SPEECH_INTERRUPT_MODE) {
-        cJSON *turn = cJSON_CreateObject();
-        if (turn == NULL) {
-            cJSON_Delete(subscriptions);
-            cJSON_Delete(data);
-            ESP_LOGE(TAG, "no mem for turn_detection");
-            ret = ESP_ERR_NO_MEM;
-            goto out;
-        }
-        cJSON_AddStringToObject(turn, "type", "server_vad");
-        cJSON_AddNumberToObject(turn, "prefix_padding_ms", 600);
-        cJSON_AddNumberToObject(turn, "silence_duration_ms",
-                                chat->config.vad_silence_mode == ESP_COZE_CHAT_VAD_SILENCE_NORMAL_MODE
-                                    ? 1000 : 500);
-        cJSON_AddItemToObject(data, "turn_detection", turn);
-    }
     cJSON_AddItemToObject(data, "event_subscriptions", subscriptions);
 
     json_str = coze_env_make_typed(chat->event_id, "chat.update", data);

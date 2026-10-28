@@ -64,16 +64,17 @@ static const char *TAG = "ai_dialog";
 static QueueHandle_t s_control_queue, s_encode_queue, s_pcm_queue;
 static SemaphoreHandle_t s_control_mutex, s_encoder_mutex, s_pcm_mutex, s_output_mutex, s_capture_mutex;
 static SemaphoreHandle_t s_opus_mutex, s_opus_data_sem;
-static atomic_bool s_initialized, s_ready, s_wake_requested, s_restore_pending, s_speech_started;
+static atomic_bool s_initialized, s_ready, s_wake_requested, s_restore_pending;
 static atomic_bool s_interrupt_requested;
+static atomic_bool s_interrupt_in_progress;
 static atomic_uint s_generation, s_turn, s_failure;
 static atomic_uint s_produced_samples, s_encoded, s_decoded, s_written, s_tx_bytes;
 static atomic_uint s_capture_drops, s_encode_drops, s_rx_drops, s_decode_drops, s_write_drops;
 static atomic_uint s_completed_seq, s_encoder_stack_free, s_pcm_stack_free, s_output_stack_free;
 static atomic_bool s_end_seen;
-static atomic_llong s_listen_since, s_wait_since, s_audio_since;
+static atomic_llong s_listen_since, s_wait_since, s_audio_since, s_playback_since;
 static unsigned s_end_sequence;
-static bool s_wait_warning, s_input_opus, s_server_vad;
+static bool s_wait_warning, s_input_opus;
 static capture_t s_capture_frame;
 static size_t s_captured;
 /* 播放打断检测已迁移到 audio_service 的统一 VAD。 */
@@ -367,16 +368,15 @@ static void on_vad_state_change(bool speaking, void *context)
 {
     (void)context;
 
-    /* 只在播放期间才处理 VAD 事件 */
-    if (!playing()) {
+    /* 播放开始后的短暂窗口只包含切换残留和扬声器回声，禁止触发打断。 */
+    if (!playing() || now_ms() - atomic_load(&s_playback_since) < 500) {
         return;
     }
 
-    /* 检测到语音开始，触发打断 */
-    if (speaking) {
+    /* 原子交换保证同一轮播放只产生一次打断请求。 */
+    if (speaking && !atomic_exchange(&s_interrupt_requested, true)) {
         ESP_LOGI(TAG, "turn=%u VAD detected speech during playback, requesting interrupt",
                  atomic_load(&s_turn));
-        atomic_store(&s_interrupt_requested, true);
     }
 }
 
@@ -397,6 +397,7 @@ static void finish(const char *reason, bool notify, bool restore)
     ai_dialog_logic_reset();
     atomic_store(&s_wake_requested, false);
     atomic_store(&s_interrupt_requested, false);
+    atomic_store(&s_interrupt_in_progress, false);
     if (active && notify) (void)coze_app_cancel(atomic_load(&s_turn));
     reset_capture();
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
@@ -565,14 +566,13 @@ static bool begin_turn(void)
         return false;
     }
     reset_capture(); atomic_fetch_add(&s_turn, 1);
-    atomic_store(&s_completed_seq, 0); atomic_store(&s_end_seen, false); atomic_store(&s_speech_started, false);
+    atomic_store(&s_completed_seq, 0); atomic_store(&s_end_seen, false);
     atomic_store(&s_listen_since, now_ms());
     if (coze_app_begin_turn(atomic_load(&s_turn)) != ESP_OK) {
         atomic_store(&s_failure, 1);
         return false;
     }
-    ESP_LOGI(TAG, "turn=%u listening: mode=%s pre-roll=300ms tail=%dms no-speech=%dms max=%dms", atomic_load(&s_turn),
-        s_server_vad ? "server_vad" : "client_interrupt",
+    ESP_LOGI(TAG, "turn=%u listening: mode=local_vad pre-roll=300ms tail=%dms no-speech=%dms max=%dms", atomic_load(&s_turn),
         CONFIG_AI_DIALOG_TAIL_SILENCE_MS, CONFIG_AI_DIALOG_NO_SPEECH_MS, CONFIG_AI_DIALOG_MAX_TURN_MS);
     return true;
 }
@@ -582,6 +582,7 @@ static void process_text(packet_t *packet)
     if (!root) return;
     const char *type = json_str(root, "type");
     if (ai_dialog_logic_is_session_active() && json_uint(root, "turnId") == atomic_load(&s_turn)) {
+ #if 0
         if (!strcmp(type, "speech_started") && s_server_vad &&
             ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING) {
             atomic_store(&s_speech_started, true);
@@ -606,26 +607,24 @@ static void process_text(packet_t *packet)
             }
             ESP_LOGI(TAG, "turn=%u server VAD detected speech_stopped, committed audio",
                      atomic_load(&s_turn));
-        } else if (!strcmp(type, "audio_start") &&
-            (ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_WAITING_REPLY ||
-             (s_server_vad && ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING))) {
+ #endif
+        if (!strcmp(type, "audio_start") &&
+            ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_WAITING_REPLY) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
 
             /* 启用 audio_service 的统一 VAD 用于播放期打断检测 */
             audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
 
-            /* server_vad 模式下扬声器已在 speech_stopped 提前启用；非 server_vad 模式在此启用 */
-            if (!s_server_vad) {
-                if (audio_service_set_output_enabled(
-                        AUDIO_SERVICE_OWNER_AI_DIALOG,
-                        true
-                    ) != ESP_OK) {
-                    finish("speaker/capture transition failed", true, true);
-                    goto audio_start_done;
-                }
+            if (audio_service_set_output_enabled(
+                    AUDIO_SERVICE_OWNER_AI_DIALOG,
+                    true
+                ) != ESP_OK) {
+                finish("speaker/capture transition failed", true, true);
+                goto audio_start_done;
             }
 
             atomic_store(&s_audio_since, now_ms());
+            atomic_store(&s_playback_since, now_ms());
             ESP_LOGI(TAG, "turn=%u first_audio after commit=%lldms", atomic_load(&s_turn), now_ms() - atomic_load(&s_wait_since));
             audio_start_done:;
         } else if (!strcmp(type, "audio_end") && playing()) {
@@ -681,6 +680,7 @@ static void on_coze_event(const coze_app_event_t *event, void *context)
         return;
     }
 
+ #if 0
     if (event->type == COZE_APP_EVENT_SPEECH_STARTED) {
         char message[128];
         snprintf(message, sizeof(message),
@@ -719,6 +719,7 @@ static void on_coze_event(const coze_app_event_t *event, void *context)
         return;
     }
 
+ #endif
     char message[192];
     const char *type = "error";
     if (event->type == COZE_APP_EVENT_AUDIO_START) {
@@ -792,12 +793,13 @@ static void ai_dialog_encode_worker(void *arg)
         if (!capture_current(&frame)) { xSemaphoreGive(s_encoder_mutex); continue; }
         if (generation != frame.generation) {
             generation = frame.generation; turn = (ai_turn_t){0}; ring = count = 0;
-            if (!s_server_vad) vad_reset_trigger(s_vad);
+            vad_reset_trigger(s_vad);
         }
-        if (s_server_vad) {
+        {
             // server_vad 要求从唤醒后的第一帧开始连续上传，不能经过本地 VAD 筛选或发送 audio_end。
             encode_send(&frame);
-        } else {
+        }
+        {
             unsigned speech = 0;
             for (unsigned i = 0; i < FRAME_SAMPLES; i += 320) if (vad_process(s_vad, frame.samples + i, 16000, 20) == VAD_SPEECH) speech++;
             bool already_started = turn.started;
@@ -805,7 +807,6 @@ static void ai_dialog_encode_worker(void *arg)
                 CONFIG_AI_DIALOG_TAIL_SILENCE_MS, CONFIG_AI_DIALOG_NO_SPEECH_MS, CONFIG_AI_DIALOG_MAX_TURN_MS);
             if (!already_started) { s_pre_roll[ring] = frame; ring = (ring + 1) % PRE_ROLL_FRAMES; if (count < PRE_ROLL_FRAMES) count++; }
             if (result == AI_TURN_STARTED) {
-                atomic_store(&s_speech_started, true);
                 ESP_LOGI(TAG, "turn=%u speech_start at +%ums", atomic_load(&s_turn), turn.elapsed_ms);
                 unsigned oldest = (ring + PRE_ROLL_FRAMES - count) % PRE_ROLL_FRAMES;
                 for (unsigned i = 0; i < count; ++i) encode_send(&s_pre_roll[(oldest + i) % PRE_ROLL_FRAMES]);
@@ -1046,6 +1047,10 @@ static void interrupt_playback(void)
     if (!playing() || !ai_dialog_logic_is_session_active()) {
         return;
     }
+    /* 取消动作只允许同一轮播放执行一次，避免多个音频任务重复发送 cancel。 */
+    if (atomic_exchange(&s_interrupt_in_progress, true)) {
+        return;
+    }
 
     const unsigned old_turn = atomic_load(&s_turn);
     ESP_LOGI(TAG, "turn=%u 检测到播放期间用户说话，开始打断", old_turn);
@@ -1074,6 +1079,7 @@ static void interrupt_playback(void)
     if (cancel_error != ESP_OK) {
         ESP_LOGE(TAG, "turn=%u 播放打断取消后端回复失败：%s", old_turn, esp_err_to_name(cancel_error));
         atomic_store(&s_failure, 1);
+        atomic_store(&s_interrupt_in_progress, false);
         return;
     }
 
@@ -1085,6 +1091,7 @@ static void interrupt_playback(void)
         return;
     }
     ESP_LOGI(TAG, "turn=%u 播放已停止，已进入新的用户语音输入轮次", atomic_load(&s_turn));
+    atomic_store(&s_interrupt_in_progress, false);
 }
 static void ai_dialog_worker(void *arg)
 {
@@ -1140,7 +1147,7 @@ static void ai_dialog_worker(void *arg)
             int64_t now = now_ms();
             ai_dialog_logic_state_t state = ai_dialog_logic_get_state();
             // server_vad 的录音阶段可能包含较长静音，不能用设备本地的无语音超时结束会话。
-            if (state == AI_DIALOG_LOGIC_STATE_LISTENING && !s_server_vad && !atomic_load(&s_speech_started) && now - atomic_load(&s_listen_since) > CONFIG_AI_DIALOG_NO_SPEECH_MS + 300) finish("no speech", true, true);
+            if (state == AI_DIALOG_LOGIC_STATE_LISTENING && now - atomic_load(&s_listen_since) > CONFIG_AI_DIALOG_NO_SPEECH_MS + 300) finish("no speech", true, true);
             if (state == AI_DIALOG_LOGIC_STATE_LISTENING && now - atomic_load(&s_listen_since) > CONFIG_AI_DIALOG_MAX_TURN_MS + 2000) finish("capture watchdog", true, true);
             if (state == AI_DIALOG_LOGIC_STATE_WAITING_REPLY) {
                 int64_t waited = now - atomic_load(&s_wait_since);
@@ -1218,7 +1225,6 @@ esp_err_t ai_dialog_init(void)
     xSemaphoreGive(s_pcm_mutex);
     xSemaphoreGive(s_encoder_mutex);
     if (!codec_ok) goto fail;
-    s_server_vad = audio_config.server_vad;
     atomic_store(&s_ready, true);
 
     if (xTaskCreate(ai_dialog_encode_worker, "voice_ai_enc", AI_DIALOG_ENCODER_STACK_BYTES, NULL, 4, &tasks[0]) != pdPASS ||

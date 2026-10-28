@@ -24,8 +24,6 @@ typedef enum {
     COZE_APP_EVENT_AUDIO_END,
     COZE_APP_EVENT_ERROR,
     COZE_APP_EVENT_DISCONNECTED,
-    COZE_APP_EVENT_SPEECH_STARTED,
-    COZE_APP_EVENT_SPEECH_STOPPED,
 } coze_app_event_type_t;
 
 /**
@@ -68,7 +66,6 @@ typedef struct {
     unsigned output_bits_per_sample;
     unsigned input_frame_us;
     unsigned output_frame_us;
-    bool server_vad;
 } coze_app_audio_config_t;
 
 esp_err_t coze_app_init(const coze_app_config_t *config);
