@@ -28,6 +28,13 @@ menu "Coze 直连 AI 应用"
         range 0 4
         default 3
 
+    config AI_DIALOG_ENABLE_PLAYBACK_VAD
+        bool "启用播放期间本地 VAD 打断"
+        default n
+        help
+            启用后，用户在播放 Coze 回复期间说话时，本地 VAD 可以打断当前播放。
+            默认关闭，避免扬声器回声被识别为用户语音而造成错误打断。
+
     config AUDIO_DRIVER_SPEAKER_VOLUME
         int "ES8311 speaker volume (0-100)"
         range 0 100
@@ -54,4 +61,3 @@ menu "Coze 直连 AI 应用"
         default 10000
 
 endmenu
-

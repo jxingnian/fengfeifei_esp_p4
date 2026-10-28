@@ -364,6 +364,7 @@ static void reset_capture(void)
  * 当 audio_service 检测到 VAD 状态变化时调用。
  * 播放期间检测到语音会触发打断。
  */
+#if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
 static void on_vad_state_change(bool speaking, void *context)
 {
     (void)context;
@@ -379,6 +380,7 @@ static void on_vad_state_change(bool speaking, void *context)
                  atomic_load(&s_turn));
     }
 }
+#endif
 
 static void acknowledge(unsigned turn, unsigned seq)
 {
@@ -582,38 +584,14 @@ static void process_text(packet_t *packet)
     if (!root) return;
     const char *type = json_str(root, "type");
     if (ai_dialog_logic_is_session_active() && json_uint(root, "turnId") == atomic_load(&s_turn)) {
- #if 0
-        if (!strcmp(type, "speech_started") && s_server_vad &&
-            ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING) {
-            atomic_store(&s_speech_started, true);
-            ESP_LOGI(TAG, "turn=%u server VAD detected speech_started", atomic_load(&s_turn));
-        } else if (!strcmp(type, "speech_stopped") && s_server_vad &&
-                   ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING) {
-            atomic_store(&s_wait_since, now_ms());
-            (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_TURN_COMMITTED);
-
-            /* 提前启用扬声器，避免后续 audio_start 时音频数据竞态导致前几帧丢失 */
-            if (audio_service_set_output_enabled(
-                    AUDIO_SERVICE_OWNER_AI_DIALOG,
-                    true
-                ) != ESP_OK) {
-                ESP_LOGW(TAG, "turn=%u 提前启用扬声器失败", atomic_load(&s_turn));
-            } else {
-                ESP_LOGI(TAG, "turn=%u 扬声器已提前启用", atomic_load(&s_turn));
-            }
-
-            if (coze_app_commit_audio(atomic_load(&s_turn)) != ESP_OK) {
-                atomic_store(&s_failure, 1);
-            }
-            ESP_LOGI(TAG, "turn=%u server VAD detected speech_stopped, committed audio",
-                     atomic_load(&s_turn));
- #endif
         if (!strcmp(type, "audio_start") &&
             ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_WAITING_REPLY) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
 
-            /* 启用 audio_service 的统一 VAD 用于播放期打断检测 */
+            /* 仅在配置开启时启用播放期间的本地 VAD打断。 */
+#if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
             audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
+#endif
 
             if (audio_service_set_output_enabled(
                     AUDIO_SERVICE_OWNER_AI_DIALOG,
@@ -680,46 +658,6 @@ static void on_coze_event(const coze_app_event_t *event, void *context)
         return;
     }
 
- #if 0
-    if (event->type == COZE_APP_EVENT_SPEECH_STARTED) {
-        char message[128];
-        snprintf(message, sizeof(message),
-                 "{\"type\":\"speech_started\",\"turnId\":%u}", event->turn);
-        packet_t packet = {
-            .length = strlen(message),
-            .data = malloc(strlen(message)),
-            .turn = event->turn,
-            .seq = 0,
-        };
-        if (packet.data != NULL) {
-            memcpy(packet.data, message, packet.length);
-            if (xQueueSendToFront(s_control_queue, &packet, 0) != pdTRUE) {
-                free(packet.data);
-            }
-        }
-        return;
-    }
-
-    if (event->type == COZE_APP_EVENT_SPEECH_STOPPED) {
-        char message[128];
-        snprintf(message, sizeof(message),
-                 "{\"type\":\"speech_stopped\",\"turnId\":%u}", event->turn);
-        packet_t packet = {
-            .length = strlen(message),
-            .data = malloc(strlen(message)),
-            .turn = event->turn,
-            .seq = 0,
-        };
-        if (packet.data != NULL) {
-            memcpy(packet.data, message, packet.length);
-            if (xQueueSendToFront(s_control_queue, &packet, 0) != pdTRUE) {
-                free(packet.data);
-            }
-        }
-        return;
-    }
-
- #endif
     char message[192];
     const char *type = "error";
     if (event->type == COZE_APP_EVENT_AUDIO_START) {
@@ -1210,11 +1148,13 @@ esp_err_t ai_dialog_init(void)
     };
     if (coze_app_init(&coze_config) != ESP_OK) goto fail;
 
-    /* 注册 audio_service 的 VAD 回调用于播放打断检测 */
+    /* 仅在配置开启时注册播放期间的 VAD打断回调。 */
+#if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
     if (audio_service_set_vad_callback(on_vad_state_change, NULL) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register VAD callback");
         goto fail;
     }
+#endif
 
     /* Coze 直连没有后台 ready 消息，启动时直接应用 Coze 组件声明的格式。 */
     coze_app_audio_config_t audio_config;
@@ -1232,7 +1172,13 @@ esp_err_t ai_dialog_init(void)
         xTaskCreate(ai_dialog_output_worker, "voice_ai_out", 6144, NULL, 5, &tasks[2]) != pdPASS ||
         xTaskCreate(ai_dialog_worker, "voice_ai_ctl", 8192, NULL, 5, &tasks[3]) != pdPASS) goto fail;
     atomic_store(&s_initialized, true);
-    ESP_LOGI(TAG, "AI dialog initialized with unified VAD interrupt detection");
+    ESP_LOGI(TAG, "AI dialog initialized: playback VAD interrupt=%s",
+#if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
+             "enabled"
+#else
+             "disabled"
+#endif
+    );
     return ESP_OK;
 fail:
     for (unsigned i = 0; i < 4; ++i) if (tasks[i]) vTaskDelete(tasks[i]);
