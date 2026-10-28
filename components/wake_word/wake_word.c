@@ -421,21 +421,33 @@ esp_err_t wake_word_stop(void)
     return ESP_OK;
 }
 
-void wake_word_start_conversation(void)
+esp_err_t wake_word_start_conversation(void)
 {
     /*
      * 播放打断功能要求采集任务在整个 AI 会话期间持续运行。
      * 同一轮会话可能多次调用本函数，因此已经处于对话模式时必须保持幂等，
      * 不能再次尝试把已经属于 AI_DIALOG 的音频所有权转移一次。
-     */
+    */
     if (s_conversation_active) {
-        return;
+        return ESP_OK;
     }
-    s_conversation_active = true;
-    (void)audio_service_transfer(
+
+    /*
+     * 必须先完成音频服务所有权转移，再修改本地模式标志。否则采集任务会
+     * 按 AI_DIALOG 所有者读取音频，而统一音频服务仍然记录为 WAKE_WORD，
+     * 后续播放提示音和读取 PCM 都会返回 ESP_ERR_INVALID_STATE。
+     */
+    esp_err_t error = audio_service_transfer(
         AUDIO_SERVICE_OWNER_WAKE_WORD,
         AUDIO_SERVICE_OWNER_AI_DIALOG
     );
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "切换到 AI 对话音频所有权失败：%s", esp_err_to_name(error));
+        return error;
+    }
+
+    s_conversation_active = true;
+    return ESP_OK;
 }
 
 void wake_word_stop_conversation(void)

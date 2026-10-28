@@ -10,6 +10,7 @@
 #include "coze_app.h"
 #include "ai_dialog_logic.h"
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,7 @@
 #include "audio_service.h"
 #include "wake_word.h"
 #include "ai_turn.h"
+#include "alert_drip_data.h"
 
 #define AI_DIALOG_ENCODER_STACK_BYTES (32U * 1024U)
 #define AI_DIALOG_WORKER_STACK_BYTES (24U * 1024U)
@@ -42,6 +44,7 @@
 #define CONTROL_QUEUE_LENGTH 32U
 #define OPUS_RING_BUFFER_BYTES (200U * 1024U)
 #define OPUS_RING_DESCRIPTOR_COUNT 4096U
+#define ALERT_DRIP_PCM_PEAK 16113
 
 /*
  * 播放打断检测使用 60 ms 的采集帧。连续两帧被本地 VAD 判定为语音后才
@@ -536,9 +539,84 @@ static bool open_codecs(const coze_app_audio_config_t *audio_config)
     }
     return true;
 }
+/**
+ * @brief 播放唤醒提示音（水滴声）。
+ *
+ * 该函数在检测到唤醒后、开始录音前播放短促提示音，给用户明确的反馈。
+ * 提示音时长约 300ms，播放期间暂停麦克风采集，避免回声干扰。
+ */
+static void play_wake_alert_sound(void)
+{
+    ESP_LOGI(TAG, "播放唤醒提示音");
+
+    /* 临时启用扬声器 */
+    esp_err_t error = audio_service_set_output_enabled(
+        AUDIO_SERVICE_OWNER_AI_DIALOG,
+        true
+    );
+    if (error != ESP_OK) {
+        ESP_LOGW(TAG, "启用扬声器失败: %s", esp_err_to_name(error));
+        return;
+    }
+
+    /*
+     * 原始提示音峰值为 16113，仅占 int16 PCM 满量程的约 49%。板级 DAC
+     * 音量已经是 100%，这里将提示音归一化到接近 int16 满量程，避免继续
+     * 受原始音频振幅限制。使用 32 位中间值，确保放大计算不会溢出。
+     */
+    const size_t chunk_size = 320; /* 20ms @ 16kHz */
+    int16_t amplified_pcm[chunk_size];
+    for (size_t offset = 0; offset < ALERT_DRIP_SAMPLE_COUNT; offset += chunk_size) {
+        size_t samples_to_write = chunk_size;
+        if (offset + samples_to_write > ALERT_DRIP_SAMPLE_COUNT) {
+            samples_to_write = ALERT_DRIP_SAMPLE_COUNT - offset;
+        }
+
+        for (size_t index = 0; index < samples_to_write; ++index) {
+            const int32_t amplified =
+                ((int32_t)alert_drip_pcm[offset + index] * INT16_MAX) /
+                ALERT_DRIP_PCM_PEAK;
+            amplified_pcm[index] = (int16_t)amplified;
+        }
+
+        error = audio_service_write_pcm(
+            AUDIO_SERVICE_OWNER_AI_DIALOG,
+            amplified_pcm,
+            samples_to_write
+        );
+
+        if (error != ESP_OK) {
+            ESP_LOGW(TAG, "提示音写入失败: %s", esp_err_to_name(error));
+            break;
+        }
+    }
+
+    /* 等待播放完成 */
+    error = audio_service_drain(AUDIO_SERVICE_OWNER_AI_DIALOG);
+    if (error != ESP_OK) {
+        ESP_LOGW(TAG, "提示音 drain 失败: %s", esp_err_to_name(error));
+    }
+
+    /* 关闭扬声器 */
+    error = audio_service_set_output_enabled(
+        AUDIO_SERVICE_OWNER_AI_DIALOG,
+        false
+    );
+    if (error != ESP_OK) {
+        ESP_LOGW(TAG, "关闭扬声器失败: %s", esp_err_to_name(error));
+    }
+
+    ESP_LOGI(TAG, "提示音播放完成");
+}
+
 static bool begin_turn(void)
 {
-    wake_word_start_conversation();
+    esp_err_t conversation_error = wake_word_start_conversation();
+    if (conversation_error != ESP_OK) {
+        ESP_LOGE(TAG, "开始对话轮次失败，音频所有权未切换：%s",
+                 esp_err_to_name(conversation_error));
+        return false;
+    }
     reset_capture(); atomic_fetch_add(&s_turn, 1);
     atomic_store(&s_completed_seq, 0); atomic_store(&s_end_seen, false); atomic_store(&s_speech_started, false);
     atomic_store(&s_listen_since, now_ms());
@@ -1102,7 +1180,19 @@ static void ai_dialog_worker(void *arg)
         if (atomic_exchange(&s_wake_requested, false) &&
             ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_IDLE) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_WAKE_DETECTED);
-            if (atomic_load(&s_ready) && coze_app_start() == ESP_OK) {
+            /*
+             * 提示音使用 AI_DIALOG 所有者访问统一音频服务，因此必须在
+             * 启动 Coze 和播放提示音之前完成 WAKE_WORD -> AI_DIALOG 转移。
+             */
+            esp_err_t conversation_error = wake_word_start_conversation();
+            if (conversation_error != ESP_OK) {
+                ai_dialog_logic_reset();
+                ESP_LOGE(TAG, "唤醒后切换 AI 对话音频所有权失败：%s",
+                         esp_err_to_name(conversation_error));
+            } else if (atomic_load(&s_ready) && coze_app_start() == ESP_OK) {
+                /* 播放唤醒提示音 */
+                play_wake_alert_sound();
+
                 (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_BACKEND_READY);
                 if (ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING) {
                     (void)begin_turn();

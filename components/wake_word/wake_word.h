@@ -106,12 +106,17 @@ esp_err_t wake_word_start(void);
 esp_err_t wake_word_stop(void);
 
 /**
- * @brief 将当前语音识别任务切换到唤醒后的连续对话采集模式。
+ * @brief 将音频资源从唤醒词服务切换到 AI 对话服务。
  *
- * 该接口只改变采集任务的工作模式，不创建新的麦克风读取任务，
+ * 该接口只改变现有采集任务的工作模式，不创建新的麦克风读取任务，
  * 从根源上避免唤醒识别和 AI 上传同时读取 ES8311。
+ *
+ * 只有底层音频服务完成所有权转移后，才会标记会话采集模式已经生效，
+ * 避免转移失败时采集任务使用错误的所有者访问统一音频服务。
+ *
+ * @return ESP_OK 切换成功或已经处于 AI 对话模式；其他值表示切换失败。
  */
-void wake_word_start_conversation(void);
+esp_err_t wake_word_start_conversation(void);
 
 /**
  * @brief 退出连续对话采集模式并恢复唤醒词监听模式。
