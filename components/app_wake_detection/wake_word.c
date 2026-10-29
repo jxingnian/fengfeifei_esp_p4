@@ -45,6 +45,7 @@ static bool s_commands_allocated;
 static TaskHandle_t s_recognition_task;
 static atomic_bool s_running;
 static atomic_bool s_conversation_active;
+static atomic_bool s_detection_paused = false;  // 新增：检测暂停标志
 static _Atomic wake_word_state_t s_state = WAKE_WORD_STATE_STOPPED;
 static wake_word_event_callback_t s_callback;
 static void *s_callback_context;
@@ -259,16 +260,17 @@ static void wake_word_recognition_task(void *argument)
         }
 
         /*
-         * 唤醒成功后继续复用同一个读取任务，把 PCM 交给 AI 会话服务。
-         * 这里不再调用 MultiNet，避免 AI 会话期间第二次读取同一音频设备。
+         * 新架构：在AI对话模式或检测暂停时，继续采集PCM并通过回调转发，
+         * 但不进行唤醒词检测。这样AI对话期间能持续接收音频数据。
          */
-        if (s_conversation_active) {
+        if (s_conversation_active || s_detection_paused) {
             if (s_pcm_callback != NULL) {
                 s_pcm_callback(audio_buffer, (size_t)sample_chunk_size, s_pcm_callback_context);
             }
             continue;
         }
 
+        /* 待机模式：进行唤醒词检测 */
         esp_mn_state_t state = s_multinet->detect(s_multinet_data, audio_buffer);
         if (state == ESP_MN_STATE_TIMEOUT) {
             /* MultiNet 完成一次识别窗口但没有得到可用命令，继续监听。 */
@@ -457,4 +459,28 @@ bool wake_word_is_conversation_active(void)
 wake_word_state_t wake_word_get_state(void)
 {
     return s_state;
+}
+
+esp_err_t wake_word_pause_detection(void)
+{
+    if (!s_running) {
+        ESP_LOGW(TAG, "唤醒词服务未运行，无法暂停检测");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_detection_paused = true;
+    ESP_LOGI(TAG, "暂停唤醒词检测（PCM采集继续）");
+    return ESP_OK;
+}
+
+esp_err_t wake_word_resume_detection(void)
+{
+    if (!s_running) {
+        ESP_LOGW(TAG, "唤醒词服务未运行，无法恢复检测");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_detection_paused = false;
+    ESP_LOGI(TAG, "恢复唤醒词检测");
+    return ESP_OK;
 }

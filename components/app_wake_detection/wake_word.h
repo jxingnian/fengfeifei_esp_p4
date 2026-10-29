@@ -133,6 +133,25 @@ bool wake_word_is_conversation_active(void);
  */
 wake_word_state_t wake_word_get_state(void);
 
+/**
+ * @brief 暂停唤醒词检测（但保持PCM采集）
+ *
+ * 用于AI对话期间，需要继续采集音频但不需要检测唤醒词。
+ * 采集任务继续运行，PCM数据通过回调转发给AI对话层。
+ *
+ * @return ESP_OK 成功；其他值表示失败
+ */
+esp_err_t wake_word_pause_detection(void);
+
+/**
+ * @brief 恢复唤醒词检测
+ *
+ * 从AI对话模式返回待机模式时调用，恢复唤醒词检测功能。
+ *
+ * @return ESP_OK 成功；其他值表示失败
+ */
+esp_err_t wake_word_resume_detection(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -76,7 +76,8 @@ static void app_on_coze_event(const coze_app_event_t *event, void *context)
         break;
 
     case COZE_APP_EVENT_AUDIO_DATA:
-        // AI对话层会处理音频数据
+        // 将音频数据转发给AI对话层处理
+        ai_dialog_on_audio_data(event->data, event->length, event->turn, event->sequence);
         break;
 
     case COZE_APP_EVENT_AUDIO_END:
@@ -314,24 +315,35 @@ static void on_enter_idle(void)
 {
     ESP_LOGI(TAG, "[状态机] 进入待机状态");
 
-    // 启动唤醒词监听
-    esp_err_t error = wake_word_start();
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "唤醒词启动失败：%s", esp_err_to_name(error));
-    }
+    // 检查wake_word服务状态
+    wake_word_state_t state = wake_word_get_state();
 
-    // 切换音频资源给唤醒词
-    audio_service_transfer(AUDIO_SERVICE_OWNER_AI_DIALOG, AUDIO_SERVICE_OWNER_WAKE_WORD);
+    if (state == WAKE_WORD_STATE_STOPPED || state == WAKE_WORD_STATE_ERROR) {
+        // wake_word未运行或出错，需要重新启动
+        esp_err_t error = wake_word_start();
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "唤醒词启动失败：%s", esp_err_to_name(error));
+            return;
+        }
+    } else {
+        // wake_word已运行，只需恢复检测
+        // 注意：音频资源已在on_conversation_end()中切换完成
+        // 这里直接恢复检测即可
+        wake_word_resume_detection();
+    }
 }
 
 static void on_ai_starting(void)
 {
     ESP_LOGI(TAG, "[状态机] AI对话启动中");
 
-    // 停止唤醒词监听
-    wake_word_stop();
+    // 1. 暂停唤醒词检测（但保持PCM采集）
+    wake_word_pause_detection();
 
-    // 切换音频资源给AI对话
+    // 2. 标记进入对话模式（必须在切换音频资源之前，避免时序问题）
+    wake_word_start_conversation();
+
+    // 3. 切换音频资源给AI对话
     audio_service_transfer(AUDIO_SERVICE_OWNER_WAKE_WORD, AUDIO_SERVICE_OWNER_AI_DIALOG);
 
     // 开始AI会话
@@ -370,20 +382,35 @@ static void on_ai_processing(void)
 static void on_ai_playing(void)
 {
     ESP_LOGI(TAG, "[状态机] AI播放回复");
-    // AI对话层会自动处理音频播放
+
+    // 主动通知AI对话层进入播放状态
+    // 这会驱动 ai_dialog_logic 状态切换，确保解码任务可以处理音频数据
+    ai_dialog_on_reply_start();
 }
 
 static void on_conversation_end(void)
 {
     ESP_LOGI(TAG, "[状态机] 对话结束，返回待机");
 
-    // 停止AI会话
-    ai_dialog_stop_session("对话结束");
+    // 注意：ai_dialog已经通过finish()发送了SESSION_END事件
+    // 这里不需要再调用ai_dialog_stop_session()，避免重复清理
 
-    // 结束Coze轮次
+    // 确保Coze轮次结束
     coze_app_end_turn(s_ai_turn);
 
-    // 返回待机状态会自动启动唤醒词
+    // 1. 先标记退出对话模式（改变wake_word的内部标记）
+    wake_word_stop_conversation();
+
+    // 2. 然后切换音频资源所有权（在进入IDLE之前完成）
+    esp_err_t error = audio_service_transfer(
+        AUDIO_SERVICE_OWNER_AI_DIALOG,
+        AUDIO_SERVICE_OWNER_WAKE_WORD
+    );
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "音频资源切换失败：%s", esp_err_to_name(error));
+    }
+
+    // 3. 状态机会自动转换到IDLE，触发on_enter_idle()恢复唤醒词检测
 }
 
 static void on_voice_call_incoming(void)

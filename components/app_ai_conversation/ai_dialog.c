@@ -440,9 +440,16 @@ static void finish(const char *reason, bool notify, bool restore)
     (void)audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, false);
     xSemaphoreGive(s_output_mutex); xSemaphoreGive(s_pcm_mutex); xSemaphoreGive(s_encoder_mutex);
     atomic_store(&s_failure, 0);
-    wake_word_stop_conversation(); atomic_store(&s_end_seen, false);
+    /*
+     * 架构修正：不再由 ai_dialog 调用 wake_word_stop_conversation()。
+     * 模式切换和音频资源归还由状态机统一管理，避免时序冲突。
+     */
+    atomic_store(&s_end_seen, false);
     atomic_store(&s_restore_pending, restore);
     ESP_LOGI(TAG, "turn=%u session ended: %s", atomic_load(&s_turn), reason);
+
+    // 通知状态机会话结束
+    emit_ai_event(AI_DIALOG_EVENT_SESSION_END, reason);
 }
 /*
  * 按 Coze 应用组件提供的音频协议打开本地上行编码器。
@@ -582,12 +589,6 @@ static void play_wake_alert_sound(void)
 
 static bool begin_turn(void)
 {
-    /*
-     * 新架构：音频资源切换由状态机统一管理。
-     * wake_word_start_conversation()现在只标记模式，不再切换音频。
-     */
-    (void)wake_word_start_conversation();
-
     reset_capture(); atomic_fetch_add(&s_turn, 1);
     atomic_store(&s_completed_seq, 0); atomic_store(&s_end_seen, false);
     atomic_store(&s_listen_since, now_ms());
@@ -605,27 +606,20 @@ static void process_text(packet_t *packet)
     if (!root) return;
     const char *type = json_str(root, "type");
     if (ai_dialog_logic_is_session_active() && json_uint(root, "turnId") == atomic_load(&s_turn)) {
-        if (!strcmp(type, "audio_start") &&
-            ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_WAITING_REPLY) {
-            (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
+        if (!strcmp(type, "audio_start")) {
+            /*
+             * 架构修正：audio_start 状态切换现在由状态机主动驱动（通过 ai_dialog_on_reply_start）。
+             * Coze 的文本事件只用于日志记录和兼容性检查，不再负责状态切换。
+             */
+            int64_t latency = now_ms() - atomic_load(&s_wait_since);
+            ESP_LOGI(TAG, "turn=%u 收到 audio_start 文本事件，首音频延迟=%lldms",
+                     atomic_load(&s_turn), latency);
 
-            /* 仅在配置开启时启用播放期间的本地 VAD打断。 */
-#if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
-            audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
-#endif
-
-            if (audio_service_set_output_enabled(
-                    AUDIO_SERVICE_OWNER_AI_DIALOG,
-                    true
-                ) != ESP_OK) {
-                finish("speaker/capture transition failed", true, true);
-                goto audio_start_done;
+            // 兼容性检查：确认状态已由状态机切换
+            if (ai_dialog_logic_get_state() != AI_DIALOG_LOGIC_STATE_PLAYING) {
+                ESP_LOGW(TAG, "turn=%u audio_start收到但状态未切换到PLAYING，可能存在事件竞争",
+                         atomic_load(&s_turn));
             }
-
-            atomic_store(&s_audio_since, now_ms());
-            atomic_store(&s_playback_since, now_ms());
-            ESP_LOGI(TAG, "turn=%u first_audio after commit=%lldms", atomic_load(&s_turn), now_ms() - atomic_load(&s_wait_since));
-            audio_start_done:;
         } else if (!strcmp(type, "audio_end") && playing()) {
             s_end_sequence = json_uint(root, "lastSequence");
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_ENDED);
@@ -1079,16 +1073,6 @@ static void ai_dialog_worker(void *arg)
         if (atomic_exchange(&s_wake_requested, false) &&
             ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_IDLE) {
             (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_WAKE_DETECTED);
-            /*
-             * 提示音使用 AI_DIALOG 所有者访问统一音频服务，因此必须在
-             * 启动 Coze 和播放提示音之前完成 WAKE_WORD -> AI_DIALOG 转移。
-             */
-            /*
-             * 新架构：音频资源切换由状态机统一管理。
-             * wake_word_start_conversation()现在只标记模式，不再切换音频。
-             * 因此不再需要检查返回的错误。
-             */
-            (void)wake_word_start_conversation();
 
             /* 启动Coze会话 */
             if (atomic_load(&s_ready) && coze_app_is_connected()) {
@@ -1102,9 +1086,13 @@ static void ai_dialog_worker(void *arg)
                     finish("Coze state transition failed", false, true);
                 }
             } else {
+                /*
+                 * 架构修正：后端未就绪时，通过 finish() 通知状态机处理回退。
+                 * 不在此处直接调用 wake_word_stop_conversation()，避免越权管理。
+                 */
                 ai_dialog_logic_reset();
-                wake_word_stop_conversation();
                 ESP_LOGW(TAG, "唤醒已忽略：AI 后端尚未就绪");
+                emit_ai_event(AI_DIALOG_EVENT_ERROR, "backend not ready");
             }
         }
         unsigned failure = atomic_exchange(&s_failure, 0);
@@ -1312,3 +1300,78 @@ esp_err_t ai_dialog_stop_session(const char *reason)
     return ESP_OK;
 }
 bool ai_dialog_is_session_active(void) { return ai_dialog_logic_is_session_active(); }
+
+esp_err_t ai_dialog_on_audio_data(const uint8_t *data, size_t length, unsigned turn, unsigned sequence)
+{
+    if (!atomic_load(&s_initialized)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (data == NULL || length == 0 || length > MAX_PACKET) {
+        atomic_fetch_add(&s_rx_drops, 1);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    unsigned evicted_count = 0;
+    if (!opus_ring_push(data, length, turn, sequence, &evicted_count)) {
+        atomic_fetch_add(&s_rx_drops, 1);
+        return ESP_FAIL;
+    }
+
+    if (evicted_count != 0) {
+        /* 200 KB 已满时只淘汰最旧完整帧，统计被淘汰的帧数量。 */
+        atomic_fetch_add(&s_rx_drops, evicted_count);
+    }
+
+    return ESP_OK;
+}
+
+void ai_dialog_on_reply_start(void)
+{
+    if (!atomic_load(&s_initialized)) {
+        ESP_LOGW(TAG, "AI对话层未初始化，忽略reply_start通知");
+        return;
+    }
+
+    ESP_LOGI(TAG, "turn=%u 状态机通知：AI开始播放回复", atomic_load(&s_turn));
+
+    // 主动驱动逻辑层状态切换到播放中
+    esp_err_t ret = ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "逻辑层状态切换失败：%s", esp_err_to_name(ret));
+        return;
+    }
+
+    // 启用播放期间的VAD打断检测
+#if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
+    esp_err_t vad_ret = audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
+    if (vad_ret != ESP_OK) {
+        ESP_LOGW(TAG, "启用VAD打断检测失败：%s", esp_err_to_name(vad_ret));
+    }
+#endif
+
+    // 启用扬声器输出
+    esp_err_t audio_ret = audio_service_set_output_enabled(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
+    if (audio_ret != ESP_OK) {
+        ESP_LOGE(TAG, "启用扬声器失败：%s", esp_err_to_name(audio_ret));
+        // 不返回，继续处理，让后续流程有机会恢复
+    }
+
+    // 记录播放开始时间
+    atomic_store(&s_audio_since, now_ms());
+    atomic_store(&s_playback_since, now_ms());
+
+    ESP_LOGI(TAG, "turn=%u 播放状态已就绪，解码任务开始处理音频数据", atomic_load(&s_turn));
+}
+
+void ai_dialog_on_reply_end(void)
+{
+    if (!atomic_load(&s_initialized)) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "turn=%u 状态机通知：AI回复播放结束", atomic_load(&s_turn));
+
+    // 驱动逻辑层状态切换
+    (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_ENDED);
+}

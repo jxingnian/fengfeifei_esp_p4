@@ -68,9 +68,11 @@ static const state_transition_t s_transition_table[] = {
     // AI对话状态转换
     {DEVICE_STATE_AI_STARTING, EVENT_AI_READY, DEVICE_STATE_AI_LISTENING, action_ai_listening},
     {DEVICE_STATE_AI_LISTENING, EVENT_USER_STOPPED, DEVICE_STATE_AI_PROCESSING, action_ai_processing},
+    {DEVICE_STATE_AI_LISTENING, EVENT_AI_REPLY_START, DEVICE_STATE_AI_PLAYING, action_ai_playing},
     {DEVICE_STATE_AI_LISTENING, EVENT_CONVERSATION_ENDED, DEVICE_STATE_IDLE, action_conversation_end},
     {DEVICE_STATE_AI_LISTENING, EVENT_CONVERSATION_TIMEOUT, DEVICE_STATE_IDLE, action_conversation_end},
     {DEVICE_STATE_AI_PROCESSING, EVENT_AI_REPLY_START, DEVICE_STATE_AI_PLAYING, action_ai_playing},
+    {DEVICE_STATE_AI_PROCESSING, EVENT_CONVERSATION_ENDED, DEVICE_STATE_IDLE, action_conversation_end},
     {DEVICE_STATE_AI_PLAYING, EVENT_AI_REPLY_END, DEVICE_STATE_AI_LISTENING, action_ai_back_to_listening},
     {DEVICE_STATE_AI_PLAYING, EVENT_CONVERSATION_ENDED, DEVICE_STATE_IDLE, action_conversation_end},
 
@@ -176,8 +178,15 @@ static void action_ai_back_to_listening(void)
 static void action_conversation_end(void)
 {
     ESP_LOGI(TAG, "Action: 对话结束，返回待机");
+
+    // 1. 先执行对话结束的清理
     if (s_ctx.callbacks.on_conversation_end) {
         s_ctx.callbacks.on_conversation_end();
+    }
+
+    // 2. 然后恢复待机状态（恢复唤醒词检测）
+    if (s_ctx.callbacks.on_enter_idle) {
+        s_ctx.callbacks.on_enter_idle();
     }
 }
 

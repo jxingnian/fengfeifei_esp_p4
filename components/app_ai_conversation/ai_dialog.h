@@ -66,6 +66,28 @@ void ai_dialog_on_pcm(const int16_t *samples, size_t sample_count, void *context
  */
 bool ai_dialog_is_session_active(void);
 
+/**
+ * @brief 处理来自 Coze 的音频数据
+ * @param data Opus 编码的音频数据
+ * @param length 数据长度
+ * @param turn 对话轮次
+ * @param sequence 音频序列号
+ * @return ESP_OK 成功, ESP_ERR_INVALID_ARG 参数无效, ESP_FAIL 处理失败
+ */
+esp_err_t ai_dialog_on_audio_data(const uint8_t *data, size_t length, unsigned turn, unsigned sequence);
+
+/**
+ * @brief 通知AI对话层：AI开始播放回复
+ * @note 由状态机在进入AI_PLAYING状态时调用，主动驱动内部状态切换
+ */
+void ai_dialog_on_reply_start(void);
+
+/**
+ * @brief 通知AI对话层：AI回复播放结束
+ * @note 由状态机在AI回复结束时调用
+ */
+void ai_dialog_on_reply_end(void);
+
 #ifdef __cplusplus
 }
 #endif
