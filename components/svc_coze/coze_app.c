@@ -235,7 +235,15 @@ esp_err_t coze_app_begin_turn(unsigned turn)
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "开始新对话轮次：turn=%u", turn);
+    /* 获取当前 conversation_id，用于调试对话上下文 */
+    char *conv_id = NULL;
+    esp_coze_chat_get_config_conversation_id(s_chat, &conv_id);
+    ESP_LOGI(TAG, "开始新对话轮次：turn=%u, conversation_id=%s",
+             turn, conv_id ? conv_id : "(auto-generate)");
+    if (conv_id) {
+        free(conv_id);
+    }
+
     s_turn = turn;
     s_sequence = 0;
     s_audio_started = false;
@@ -279,6 +287,29 @@ esp_err_t coze_app_end_turn(unsigned turn)
     ESP_LOGI(TAG, "结束对话轮次：turn=%u", turn);
     s_audio_started = false;
     coze_app_emit(COZE_APP_EVENT_TURN_END, NULL, 0, 0);
+    return ESP_OK;
+}
+
+esp_err_t coze_app_reset_conversation(void)
+{
+    if (!s_initialized || s_chat == NULL) {
+        ESP_LOGW(TAG, "Coze未初始化，无法重置对话上下文");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "重置对话上下文，清空 conversation_id");
+
+    /*
+     * 清空 conversation_id，让服务端在下次 begin_turn 时自动生成新的。
+     * 这样可以确保每次新唤醒都是全新的对话上下文，避免本地和云端轮次不匹配。
+     */
+    esp_err_t err = esp_coze_set_chat_config_conversation_id(s_chat, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "清空 conversation_id 失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "对话上下文已重置");
     return ESP_OK;
 }
 

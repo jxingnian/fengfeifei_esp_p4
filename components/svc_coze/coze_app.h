@@ -114,6 +114,14 @@ esp_err_t coze_app_cancel(unsigned turn);
 esp_err_t coze_app_end_turn(unsigned turn);
 
 /**
+ * @brief 重置对话上下文，清空 conversation_id
+ *
+ * 用于结束当前对话会话，下次开始新对话时使用新的 conversation_id。
+ * 避免本地和云端对话轮次不匹配的问题。
+ */
+esp_err_t coze_app_reset_conversation(void);
+
+/**
  * @brief 断开连接并停止服务
  */
 void coze_app_disconnect(void);

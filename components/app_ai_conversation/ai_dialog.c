@@ -415,8 +415,13 @@ static void acknowledge(unsigned turn, unsigned seq)
  *
  * 先将逻辑层置为待机，再等待编码、解码和播放任务退出当前数据，保证
  * 会话结束时不会再有旧会话写入统一音频服务。
+ *
+ * @param reason 结束原因
+ * @param notify 是否通知后端取消当前轮次
+ * @param restore 是否恢复唤醒监听
+ * @param reset_conversation 是否重置 conversation_id（只有真正结束会话时才重置）
  */
-static void finish(const char *reason, bool notify, bool restore)
+static void finish(const char *reason, bool notify, bool restore, bool reset_conversation)
 {
     bool active = ai_dialog_logic_is_session_active();
     ai_dialog_logic_reset();
@@ -428,6 +433,16 @@ static void finish(const char *reason, bool notify, bool restore)
     xSemaphoreTake(s_encoder_mutex, portMAX_DELAY);
     xSemaphoreTake(s_pcm_mutex, portMAX_DELAY);
     xSemaphoreTake(s_output_mutex, portMAX_DELAY);
+
+    /*
+     * 多轮对话修正：只在会话真正结束时才重置 conversation_id。
+     * 播放结束后不重置，让用户可以继续说话，保持同一对话上下文。
+     */
+    if (reset_conversation) {
+        (void)coze_app_reset_conversation();
+        ESP_LOGI(TAG, "turn=%u conversation_id 已重置，下次将创建新会话", atomic_load(&s_turn));
+    }
+
     coze_app_end_turn(atomic_load(&s_turn));
     opus_ring_clear();
     clear_pcm();
@@ -448,7 +463,8 @@ static void finish(const char *reason, bool notify, bool restore)
      */
     atomic_store(&s_end_seen, false);
     atomic_store(&s_restore_pending, restore);
-    ESP_LOGI(TAG, "turn=%u session ended: %s", atomic_load(&s_turn), reason);
+    ESP_LOGI(TAG, "turn=%u session ended: %s (reset_conversation=%d)",
+             atomic_load(&s_turn), reason, reset_conversation);
 
     // 通知状态机会话结束
     emit_ai_event(AI_DIALOG_EVENT_SESSION_END, reason);
@@ -888,6 +904,9 @@ static void ai_dialog_output_worker(void *arg)
 /*
  * 音频结束事件不等于已经播放完成：必须同时确认 Opus 环形缓冲区、PCM 队列、
  * 解码任务和 I2S DMA 尾部都已经排空，才能切回待机监听。
+ *
+ * 多轮对话修正：播放结束后不立即开始新 turn，而是回到 LISTENING 状态，
+ * 等待用户继续说话（保持同一 conversation_id 和 turn）。
  */
 static void try_drain(void)
 {
@@ -909,22 +928,32 @@ static void try_drain(void)
             false
         );
         acknowledge(atomic_load(&s_turn), s_end_sequence);
-        ESP_LOGI(TAG, "turn=%u playback_drained seq=%u/%u dma=%s", atomic_load(&s_turn), atomic_load(&s_completed_seq), s_end_sequence, esp_err_to_name(error));
+        ESP_LOGI(TAG, "turn=%u playback_drained seq=%u/%u dma=%s; 保持同一会话，等待用户继续说话",
+                 atomic_load(&s_turn), atomic_load(&s_completed_seq), s_end_sequence, esp_err_to_name(error));
         (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_PLAYBACK_DRAINED);
         atomic_store(&s_end_seen, false);
+
+        /*
+         * 多轮对话修正：播放结束后回到 LISTENING 状态，但不增加 turn，
+         * 不重置 conversation_id，让用户可以继续对话。
+         */
+        reset_capture();
+        atomic_store(&s_completed_seq, 0);
+        atomic_store(&s_listen_since, now_ms());
+        atomic_store(&s_restore_pending, true);
+        ESP_LOGI(TAG, "turn=%u 回到监听状态，conversation_id 保持不变，等待用户继续说话",
+                 atomic_load(&s_turn));
     }
     xSemaphoreGive(s_output_mutex); xSemaphoreGive(s_pcm_mutex);
-    if (drained) {
-        if (error == ESP_OK && begin_turn()) atomic_store(&s_restore_pending, true);
-        else atomic_store(&s_failure, 3);
-    }
 }
 
 /**
  * @brief 中断当前 AI 回复，但不关闭 Coze WebSocket。
  *
  * 播放打断和异常结束是两条不同的生命周期：异常结束可以关闭会话，
- * 播放打断必须保留长连接，立即开始新一轮对话。
+ * 播放打断必须保留长连接，立即回到监听状态继续同一对话。
+ *
+ * 多轮对话修正：打断后不增加 turn，不重置 conversation_id，保持同一会话上下文。
  */
 static void interrupt_playback(void)
 {
@@ -967,14 +996,18 @@ static void interrupt_playback(void)
         return;
     }
 
-    /* 恢复逻辑状态后立即开始新 turn，旧网络事件会被 turn/generation 丢弃。 */
+    /*
+     * 多轮对话修正：打断后回到 LISTENING 状态，但不增加 turn，
+     * 不重置 conversation_id，让用户的打断也属于同一对话会话。
+     */
     (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_WAKE_DETECTED);
     (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_BACKEND_READY);
-    if (!begin_turn()) {
-        atomic_store(&s_failure, 1);
-        return;
-    }
-    ESP_LOGI(TAG, "turn=%u 播放已停止，已进入新的用户语音输入轮次", atomic_load(&s_turn));
+
+    reset_capture();
+    atomic_store(&s_completed_seq, 0);
+    atomic_store(&s_listen_since, now_ms());
+
+    ESP_LOGI(TAG, "turn=%u 播放已停止，回到监听状态（conversation_id 保持不变）", atomic_load(&s_turn));
     atomic_store(&s_interrupt_in_progress, false);
 }
 static void ai_dialog_worker(void *arg)
@@ -1007,7 +1040,7 @@ static void ai_dialog_worker(void *arg)
                 if (ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_LISTENING) {
                     (void)begin_turn();
                 } else {
-                    finish("Coze state transition failed", false, true);
+                    finish("Coze state transition failed", false, true, true);
                 }
             } else {
                 /*
@@ -1020,27 +1053,27 @@ static void ai_dialog_worker(void *arg)
             }
         }
         unsigned failure = atomic_exchange(&s_failure, 0);
-        if (failure && ai_dialog_logic_is_session_active()) finish(failure == 2 ? "no speech" : "audio pipeline failure", true, true);
+        if (failure && ai_dialog_logic_is_session_active()) finish(failure == 2 ? "no speech" : "audio pipeline failure", true, true, true);
         if (ai_dialog_logic_is_session_active()) {
             if (!coze_app_is_connected()) {
                 atomic_store(&s_ready, false);
                 (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_BACKEND_STOPPED);
-                finish("connection lost", false, true);
+                finish("connection lost", false, true, true);
             }
             int64_t now = now_ms();
             ai_dialog_logic_state_t state = ai_dialog_logic_get_state();
             // server_vad 的录音阶段可能包含较长静音，不能用设备本地的无语音超时结束会话。
-            if (state == AI_DIALOG_LOGIC_STATE_LISTENING && now - atomic_load(&s_listen_since) > CONFIG_AI_DIALOG_NO_SPEECH_MS + 300) finish("no speech", true, true);
-            if (state == AI_DIALOG_LOGIC_STATE_LISTENING && now - atomic_load(&s_listen_since) > CONFIG_AI_DIALOG_MAX_TURN_MS + 2000) finish("capture watchdog", true, true);
+            if (state == AI_DIALOG_LOGIC_STATE_LISTENING && now - atomic_load(&s_listen_since) > CONFIG_AI_DIALOG_NO_SPEECH_MS + 300) finish("no speech", true, true, true);
+            if (state == AI_DIALOG_LOGIC_STATE_LISTENING && now - atomic_load(&s_listen_since) > CONFIG_AI_DIALOG_MAX_TURN_MS + 2000) finish("capture watchdog", true, true, true);
             if (state == AI_DIALOG_LOGIC_STATE_WAITING_REPLY) {
                 int64_t waited = now - atomic_load(&s_wait_since);
                 if (waited >= 5000 && !s_wait_warning) { ESP_LOGW(TAG, "turn=%u still waiting for first audio (%lldms)", atomic_load(&s_turn), waited); s_wait_warning = true; }
-                if (waited >= CONFIG_AI_DIALOG_REPLY_TIMEOUT_MS) finish("first audio timeout", true, true);
+                if (waited >= CONFIG_AI_DIALOG_REPLY_TIMEOUT_MS) finish("first audio timeout", true, true, true);
             } else s_wait_warning = false;
             if (state == AI_DIALOG_LOGIC_STATE_PLAYING) {
                 unsigned completed = atomic_load(&s_completed_seq);
                 if (completed != last_progress) { last_progress = completed; progress_at = now; }
-                if (now - progress_at > 15000 && now - atomic_load(&s_audio_since) > 15000) finish("playback stalled", true, true);
+                if (now - progress_at > 15000 && now - atomic_load(&s_audio_since) > 15000) finish("playback stalled", true, true, true);
                 else try_drain();
             } else { progress_at = now; last_progress = 0; }
         }
@@ -1222,7 +1255,11 @@ esp_err_t ai_dialog_stop_session(const char *reason)
 {
     if (!atomic_load(&s_initialized)) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_control_mutex, portMAX_DELAY);
-    finish(reason ? reason : "external stop", true, false);
+    /*
+     * 外部主动停止会话时，需要重置 conversation_id，
+     * 因为这代表用户主动结束当前对话，下次应该是新会话。
+     */
+    finish(reason ? reason : "external stop", true, false, true);
     xSemaphoreGive(s_control_mutex);
     return ESP_OK;
 }
