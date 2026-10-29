@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "backend_pairing.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        nvs_flash
+        esp_websocket_client
+        cjson
+        freertos
+        esp-tls
+        mbedtls
+)

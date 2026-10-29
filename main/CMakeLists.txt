@@ -6,6 +6,7 @@ idf_component_register(
     PRIV_REQUIRES
         esp_event
         nvs_flash
+        esp_wifi
     REQUIRES
         device_state_machine
         svc_wifi_provisioning
@@ -15,4 +16,6 @@ idf_component_register(
         svc_coze
         app_voice_call
         app_video_call
+        svc_backend_pairing
+        app_pairing_ui
 )
