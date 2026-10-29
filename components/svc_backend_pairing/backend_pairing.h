@@ -100,6 +100,15 @@ esp_err_t backend_pairing_start(void);
 esp_err_t backend_pairing_stop(void);
 
 /**
+ * @brief 重启配对（停止后重新开始）
+ *
+ * 用于配对码过期或连接错误后重新尝试配对
+ *
+ * @return esp_err_t ESP_OK成功，其他失败
+ */
+esp_err_t backend_pairing_restart(void);
+
+/**
  * @brief 获取当前配对码（用于网页显示）
  *
  * @return const char* 配对码字符串，如果未生成则返回NULL

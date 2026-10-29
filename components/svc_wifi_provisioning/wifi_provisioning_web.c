@@ -54,8 +54,13 @@ static const char s_index_html[] =
     "button.secondary{background:#64748b}button.danger{background:#dc2626;padding:7px 10px;font-size:13px}input{width:100%;margin-bottom:10px}"
     ".row{display:flex;gap:9px}.row button{flex:1}.network{display:flex;align-items:center;justify-content:space-between;border-top:1px solid #eef0f3;padding:11px 0}"
     ".network:first-child{border-top:0}.network-main{min-width:0}.ssid{font-weight:600;overflow:hidden;text-overflow:ellipsis}.meta{font-size:12px;color:#64748b;margin-top:3px}"
-    ".tip{font-size:13px;color:#64748b;line-height:1.6}.message{min-height:22px;color:#2563eb;font-size:14px;margin-top:9px}</style></head><body>"
-    "<div class='wrap'><h1>设备 Wi-Fi 配网</h1>"
+    ".tip{font-size:13px;color:#64748b;line-height:1.6}.message{min-height:22px;color:#2563eb;font-size:14px;margin-top:9px}"
+    "#pairingBanner{display:none;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:18px;text-align:center;border-radius:14px;margin-bottom:14px;box-shadow:0 4px 18px #00000012}"
+    "#pairingBanner a{color:#fff;text-decoration:none;font-size:18px;font-weight:600;display:block}"
+    "#pairingBanner a:hover{opacity:0.9}</style></head><body>"
+    "<div class='wrap'>"
+    "<div id='pairingBanner'><a href='/pairing'>📱 设备配对 - 点击查看配对码 →</a></div>"
+    "<h1>设备 Wi-Fi 配网</h1>"
     "<div class='card'><h2>当前状态</h2><div class='status'>"
     "<span>运行状态</span><b id='state'>读取中</b><span>当前 Wi-Fi</span><b id='current'>-</b>"
     "<span>STA 地址</span><b id='staIp'>-</b><span>配网地址</span><b id='apIp'>192.168.4.1</b>"
@@ -76,6 +81,7 @@ static const char s_index_html[] =
     "async function removeWifi(name){if(!confirm(`确认删除 ${name}？`))return;const body=new URLSearchParams({ssid:name});try{await getJson('/api/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});await refresh();}catch(e){message.textContent=e.message;}}"
     "function attr(v){return encodeURIComponent(v).replace(/'/g,'%27');}"
     "function escapeHtml(v){return String(v).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}"
+    "fetch('/api/app-mode').then(r=>r.json()).then(d=>{if(d.pairing_mode)document.getElementById('pairingBanner').style.display='block';}).catch(()=>{});"
     "refresh();setInterval(refresh,3000);</script></body></html>";
 
 /**

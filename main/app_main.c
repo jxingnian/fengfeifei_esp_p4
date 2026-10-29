@@ -578,6 +578,18 @@ static void app_on_pairing_event(const backend_pairing_event_t *event, void *con
     case BACKEND_PAIRING_EVENT_ERROR:
         ESP_LOGE(TAG, "配对错误: %s", event->error_message);
         pairing_ui_show_error(event->error_message);
+
+        // 延迟3秒后自动重启配对流程
+        ESP_LOGI(TAG, "将在3秒后自动重新连接...");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+
+        esp_err_t err = backend_pairing_restart();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "重启配对失败: %s", esp_err_to_name(err));
+            pairing_ui_show_error("自动重连失败，请手动刷新页面");
+        } else {
+            ESP_LOGI(TAG, "配对已重启，等待新配对码...");
+        }
         break;
 
     case BACKEND_PAIRING_EVENT_TIMEOUT:
@@ -613,9 +625,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         // 如果处于配对模式，启动配对流程
         if (s_pairing_mode) {
             ESP_LOGI(TAG, "Wi-Fi连接成功，启动配对流程");
-
-            // 启动配对网页
-            pairing_ui_start();
 
             // 获取设备MAC地址作为UID
             uint8_t mac[6];
@@ -694,6 +703,15 @@ void app_main(void)
                                                 &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                 &wifi_event_handler, NULL));
+
+    // 如果处于配对模式，先注册配对页面（必须在WiFi启动之前）
+    if (s_pairing_mode) {
+        ESP_LOGI(TAG, "配对模式：注册配对网页...");
+        esp_err_t err = pairing_ui_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "配对网页注册失败: %s", esp_err_to_name(err));
+        }
+    }
 
     // 启动Wi-Fi配网
     esp_err_t error = p4_c5_wifi_start();

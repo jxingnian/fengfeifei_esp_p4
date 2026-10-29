@@ -26,6 +26,13 @@ extern "C" {
 esp_err_t pairing_ui_start(void);
 
 /**
+ * @brief 设置配对模式标志
+ *
+ * @param is_pairing_mode true为配对模式，false为正常模式
+ */
+void pairing_ui_set_mode(bool is_pairing_mode);
+
+/**
  * @brief 更新配对码显示
  *
  * @param code 配对码（6位数字）

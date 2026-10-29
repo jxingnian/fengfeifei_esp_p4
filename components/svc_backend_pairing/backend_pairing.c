@@ -123,6 +123,7 @@ esp_err_t backend_pairing_start(void)
         .uri = s_pairing_ctx.config.server_url,
         .reconnect_timeout_ms = 5000,
         .network_timeout_ms = 10000,
+        .ping_interval_sec = 30,  // 每30秒发送心跳ping，保持连接活跃
         .crt_bundle_attach = esp_crt_bundle_attach,  // 使用ESP-IDF内置证书库验证服务器
     };
 
@@ -170,6 +171,25 @@ esp_err_t backend_pairing_stop(void)
     s_pairing_ctx.state = PAIRING_STATE_IDLE;
 
     return ESP_OK;
+}
+
+esp_err_t backend_pairing_restart(void)
+{
+    ESP_LOGI(TAG, "重启配对流程");
+
+    // 先停止当前配对（如果正在进行）
+    backend_pairing_stop();
+
+    // 清理旧的配对码
+    s_pairing_ctx.pairing_code[0] = '\0';
+    s_pairing_ctx.code_expires_in = 0;
+    s_pairing_ctx.error_message[0] = '\0';
+
+    // 延迟100ms确保资源释放
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // 重新启动配对
+    return backend_pairing_start();
 }
 
 const char* backend_pairing_get_code(void)
@@ -472,6 +492,15 @@ static void process_error(cJSON *json)
     strncpy(s_pairing_ctx.error_message, error_msg, sizeof(s_pairing_ctx.error_message) - 1);
     s_pairing_ctx.state = PAIRING_STATE_ERROR;
     notify_event(BACKEND_PAIRING_EVENT_ERROR);
+
+    // 停止WebSocket连接，允许重新启动
+    if (s_pairing_ctx.ws_client) {
+        esp_websocket_client_stop(s_pairing_ctx.ws_client);
+        esp_websocket_client_destroy(s_pairing_ctx.ws_client);
+        s_pairing_ctx.ws_client = NULL;
+    }
+    s_pairing_ctx.active = false;
+    ESP_LOGI(TAG, "WebSocket连接已清理，可以重新启动配对");
 }
 
 static void notify_event(backend_pairing_event_type_t type)
