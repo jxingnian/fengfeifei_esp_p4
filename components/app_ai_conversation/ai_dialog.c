@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "cJSON.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -52,7 +51,21 @@
  */
 
 typedef struct { unsigned generation; int16_t samples[FRAME_SAMPLES]; } capture_t;
-typedef struct { size_t length; uint8_t *data; unsigned turn, seq; } packet_t;
+typedef enum {
+    AI_DIALOG_CONTROL_AUDIO_START = 0,
+    AI_DIALOG_CONTROL_AUDIO_END,
+} ai_dialog_control_type_t;
+
+/**
+ * @brief AI对话控制任务使用的后端事件消息。
+ *
+ * Coze回调线程只投递消息，状态迁移和音频设备操作全部由控制任务串行执行。
+ */
+typedef struct {
+    ai_dialog_control_type_t type;
+    unsigned turn;
+    unsigned sequence;
+} ai_dialog_control_packet_t;
 typedef struct { size_t length; uint8_t *data; unsigned generation, turn, seq; } pcm_t;
 typedef struct {
     size_t offset;
@@ -112,17 +125,6 @@ static void emit_ai_event(ai_dialog_event_type_t type, const char *message)
     s_event_config.on_event(&event, s_event_config.context);
 }
 
-static unsigned json_uint(cJSON *root, const char *key)
-{
-    cJSON *v = cJSON_GetObjectItemCaseSensitive(root, key);
-    return cJSON_IsNumber(v) && v->valuedouble >= 0 && v->valuedouble <= UINT32_MAX
-        ? (unsigned)v->valuedouble : 0;
-}
-static const char *json_str(cJSON *root, const char *key)
-{
-    const char *s = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, key));
-    return s ? s : "";
-}
 static bool playing(void)
 {
     return ai_dialog_logic_get_state() == AI_DIALOG_LOGIC_STATE_PLAYING;
@@ -600,124 +602,44 @@ static bool begin_turn(void)
         CONFIG_AI_DIALOG_TAIL_SILENCE_MS, CONFIG_AI_DIALOG_NO_SPEECH_MS, CONFIG_AI_DIALOG_MAX_TURN_MS);
     return true;
 }
-static void process_text(packet_t *packet)
+static void process_backend_event(const ai_dialog_control_packet_t *packet)
 {
-    cJSON *root = cJSON_ParseWithLength((char *)packet->data, packet->length);
-    if (!root) return;
-    const char *type = json_str(root, "type");
-    if (ai_dialog_logic_is_session_active() && json_uint(root, "turnId") == atomic_load(&s_turn)) {
-        if (!strcmp(type, "audio_start")) {
-            /*
-             * 架构修正：audio_start 状态切换现在由状态机主动驱动（通过 ai_dialog_on_reply_start）。
-             * Coze 的文本事件只用于日志记录和兼容性检查，不再负责状态切换。
-             */
-            int64_t latency = now_ms() - atomic_load(&s_wait_since);
-            ESP_LOGI(TAG, "turn=%u 收到 audio_start 文本事件，首音频延迟=%lldms",
-                     atomic_load(&s_turn), latency);
-
-            // 兼容性检查：确认状态已由状态机切换
-            if (ai_dialog_logic_get_state() != AI_DIALOG_LOGIC_STATE_PLAYING) {
-                ESP_LOGW(TAG, "turn=%u audio_start收到但状态未切换到PLAYING，可能存在事件竞争",
-                         atomic_load(&s_turn));
-            }
-        } else if (!strcmp(type, "audio_end") && playing()) {
-            s_end_sequence = json_uint(root, "lastSequence");
-            (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_ENDED);
-            atomic_store(&s_end_seen, true);
-        } else if (!strcmp(type, "audio_stop")) {
-            (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_BACKEND_STOPPED);
-            finish("Coze response stopped", false, true);
-        } else if (!strcmp(type, "error")) {
-            (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_BACKEND_ERROR);
-            finish(json_str(root, "message"), false, true);
-        }
-        else if (!strcmp(type, "transcript")) ESP_LOGI(TAG, "turn=%u transcript received", atomic_load(&s_turn));
-    } else if (!strcmp(type, "error") && !json_uint(root, "turnId") && ai_dialog_logic_is_session_active()) {
-        (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_BACKEND_ERROR);
-        finish(json_str(root, "message"), false, true);
-    }
-    cJSON_Delete(root);
-}
-
-/**
- * @brief 把直连后端事件复制到应用层控制/音频队列。
- *
- * Coze 回调运行在 WebSocket 任务中，不能在回调里执行状态迁移、编解码或
- * 播放。这里仅复制数据并零等待入队，所有后续动作由应用控制任务串行处理。
- */
-/**
- * @brief 处理Coze事件（已移除，由app_main统一处理）
- *
- * 注意：在新架构中，Coze事件由app_main.c中的app_on_coze_event统一处理，
- * 然后通过状态机分发到各个业务模块。这里保留函数定义以兼容旧代码。
- */
-#if 0  // 禁用此函数，不再使用
-static void on_coze_event(const coze_app_event_t *event, void *context)
-{
-    (void)context;
-    if (event == NULL || !atomic_load(&s_initialized)) {
+    if (packet->turn != atomic_load(&s_turn) || !ai_dialog_logic_is_session_active()) {
         return;
     }
 
-    if (event->type == COZE_APP_EVENT_AUDIO_DATA) {
-        if (event->data == NULL || event->length == 0 || event->length > MAX_PACKET) {
-            atomic_fetch_add(&s_rx_drops, 1);
+    if (packet->type == AI_DIALOG_CONTROL_AUDIO_START) {
+        if (ai_dialog_logic_get_state() != AI_DIALOG_LOGIC_STATE_WAITING_REPLY) {
+            ESP_LOGW(TAG, "turn=%u 音频开始事件状态无效：state=%d",
+                     packet->turn, ai_dialog_logic_get_state());
             return;
         }
-        unsigned evicted_count = 0;
-        if (!opus_ring_push(
-                event->data,
-                event->length,
-                event->turn,
-                event->sequence,
-                &evicted_count
-            )) {
-            atomic_fetch_add(&s_rx_drops, 1);
-        } else if (evicted_count != 0) {
-            /* 200 KB 已满时只淘汰最旧完整帧，统计被淘汰的帧数量。 */
-            atomic_fetch_add(&s_rx_drops, evicted_count);
+        (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
+#if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
+        (void)audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
+#endif
+        esp_err_t error = audio_service_set_output_enabled(
+            AUDIO_SERVICE_OWNER_AI_DIALOG, true);
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "turn=%u 启用扬声器失败：%s", packet->turn, esp_err_to_name(error));
+            atomic_store(&s_failure, 1);
+            return;
         }
-        return;
-    }
-
-    char message[192];
-    const char *type = "error";
-    if (event->type == COZE_APP_EVENT_AUDIO_START) {
-        type = "audio_start";
-        snprintf(message, sizeof(message),
-                 "{\"type\":\"%s\",\"turnId\":%u}", type, event->turn);
-    } else if (event->type == COZE_APP_EVENT_AUDIO_END) {
-        type = "audio_end";
-        snprintf(message, sizeof(message),
-                 "{\"type\":\"%s\",\"turnId\":%u,\"lastSequence\":%u}",
-                 type, event->turn, event->sequence);
-    } else if (event->type == COZE_APP_EVENT_DISCONNECTED) {
-        snprintf(message, sizeof(message),
-                 "{\"type\":\"error\",\"turnId\":%u,\"message\":\"Coze connection disconnected\"}",
-                 event->turn);
-    } else {
-        snprintf(message, sizeof(message),
-                 "{\"type\":\"error\",\"turnId\":%u,\"message\":\"Coze application error\"}",
-                 event->turn);
-    }
-
-    packet_t packet = {
-        .length = strlen(message),
-        .data = malloc(strlen(message)),
-        .turn = event->turn,
-        .seq = event->sequence,
-    };
-    if (packet.data == NULL) {
-        atomic_store(&s_failure, 4);
-        return;
-    }
-    memcpy(packet.data, message, packet.length);
-    if (xQueueSendToFront(s_control_queue, &packet, 0) != pdTRUE) {
-        free(packet.data);
-        atomic_store(&s_failure, 4);
+        atomic_store(&s_audio_since, now_ms());
+        atomic_store(&s_playback_since, now_ms());
+        ESP_LOGI(TAG, "turn=%u first_audio after commit=%lldms; playback ready",
+                 packet->turn, now_ms() - atomic_load(&s_wait_since));
+    } else if (packet->type == AI_DIALOG_CONTROL_AUDIO_END) {
+        if (!playing()) {
+            return;
+        }
+        s_end_sequence = packet->sequence;
+        (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_ENDED);
+        atomic_store(&s_end_seen, true);
+        ESP_LOGI(TAG, "turn=%u backend audio end received seq=%u",
+                 packet->turn, packet->sequence);
     }
 }
-#endif  // 结束 #if 0
 
 static bool capture_current(capture_t *frame)
 {
@@ -1065,8 +987,10 @@ static void ai_dialog_worker(void *arg)
     unsigned last_progress = 0;
     for (;;) {
         xSemaphoreTake(s_control_mutex, portMAX_DELAY);
-        packet_t p;
-        while (xQueueReceive(s_control_queue, &p, 0) == pdTRUE) { process_text(&p); free(p.data); }
+        ai_dialog_control_packet_t packet;
+        while (xQueueReceive(s_control_queue, &packet, 0) == pdTRUE) {
+            process_backend_event(&packet);
+        }
         if (atomic_exchange(&s_interrupt_requested, false)) {
             interrupt_playback();
         }
@@ -1161,7 +1085,10 @@ esp_err_t ai_dialog_init(const ai_dialog_config_t *config)
     s_event_config = *config;
 
     if (ai_dialog_logic_init() != ESP_OK) return ESP_FAIL;
-    s_control_queue = xQueueCreate(CONTROL_QUEUE_LENGTH, sizeof(packet_t));
+    s_control_queue = xQueueCreate(
+        CONTROL_QUEUE_LENGTH,
+        sizeof(ai_dialog_control_packet_t)
+    );
     s_encode_queue = xQueueCreateWithCaps(ENCODE_QUEUE_LENGTH, sizeof(capture_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_pcm_queue = xQueueCreate(PCM_QUEUE_LENGTH, sizeof(pcm_t));
     s_control_mutex = xSemaphoreCreateMutex(); s_capture_mutex = xSemaphoreCreateMutex();
@@ -1326,52 +1253,40 @@ esp_err_t ai_dialog_on_audio_data(const uint8_t *data, size_t length, unsigned t
     return ESP_OK;
 }
 
-void ai_dialog_on_reply_start(void)
+static esp_err_t enqueue_backend_event(
+    ai_dialog_control_type_t type,
+    unsigned turn,
+    unsigned sequence
+)
 {
-    if (!atomic_load(&s_initialized)) {
-        ESP_LOGW(TAG, "AI对话层未初始化，忽略reply_start通知");
-        return;
+    if (!atomic_load(&s_initialized) || s_control_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "turn=%u 状态机通知：AI开始播放回复", atomic_load(&s_turn));
-
-    // 主动驱动逻辑层状态切换到播放中
-    esp_err_t ret = ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_STARTED);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "逻辑层状态切换失败：%s", esp_err_to_name(ret));
-        return;
+    ai_dialog_control_packet_t packet = {
+        .type = type,
+        .turn = turn,
+        .sequence = sequence,
+    };
+    if (xQueueSend(s_control_queue, &packet, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "turn=%u 后端音频事件队列已满：type=%d",
+                 turn, (int)type);
+        atomic_store(&s_failure, 1);
+        return ESP_ERR_NO_MEM;
     }
-
-    // 启用播放期间的VAD打断检测
-#if CONFIG_AI_DIALOG_ENABLE_PLAYBACK_VAD
-    esp_err_t vad_ret = audio_service_enable_vad(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
-    if (vad_ret != ESP_OK) {
-        ESP_LOGW(TAG, "启用VAD打断检测失败：%s", esp_err_to_name(vad_ret));
-    }
-#endif
-
-    // 启用扬声器输出
-    esp_err_t audio_ret = audio_service_set_output_enabled(AUDIO_SERVICE_OWNER_AI_DIALOG, true);
-    if (audio_ret != ESP_OK) {
-        ESP_LOGE(TAG, "启用扬声器失败：%s", esp_err_to_name(audio_ret));
-        // 不返回，继续处理，让后续流程有机会恢复
-    }
-
-    // 记录播放开始时间
-    atomic_store(&s_audio_since, now_ms());
-    atomic_store(&s_playback_since, now_ms());
-
-    ESP_LOGI(TAG, "turn=%u 播放状态已就绪，解码任务开始处理音频数据", atomic_load(&s_turn));
+    return ESP_OK;
 }
 
-void ai_dialog_on_reply_end(void)
+esp_err_t ai_dialog_on_audio_start(unsigned turn)
 {
-    if (!atomic_load(&s_initialized)) {
-        return;
-    }
+    return enqueue_backend_event(AI_DIALOG_CONTROL_AUDIO_START, turn, 0);
+}
 
-    ESP_LOGI(TAG, "turn=%u 状态机通知：AI回复播放结束", atomic_load(&s_turn));
-
-    // 驱动逻辑层状态切换
-    (void)ai_dialog_logic_handle_event(AI_DIALOG_LOGIC_EVENT_AUDIO_ENDED);
+esp_err_t ai_dialog_on_audio_end(unsigned turn, unsigned last_sequence)
+{
+    return enqueue_backend_event(
+        AI_DIALOG_CONTROL_AUDIO_END,
+        turn,
+        last_sequence
+    );
 }

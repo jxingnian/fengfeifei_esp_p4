@@ -77,16 +77,20 @@ bool ai_dialog_is_session_active(void);
 esp_err_t ai_dialog_on_audio_data(const uint8_t *data, size_t length, unsigned turn, unsigned sequence);
 
 /**
- * @brief 通知AI对话层：AI开始播放回复
- * @note 由状态机在进入AI_PLAYING状态时调用，主动驱动内部状态切换
+ * @brief 通知AI对话层后端已经开始返回回复音频。
+ *
+ * 事件会投递到AI对话控制任务，由控制任务统一切换内部状态并打开扬声器，
+ * 避免在Coze WebSocket任务中直接操作状态机和音频设备。
  */
-void ai_dialog_on_reply_start(void);
+esp_err_t ai_dialog_on_audio_start(unsigned turn);
 
 /**
- * @brief 通知AI对话层：AI回复播放结束
- * @note 由状态机在AI回复结束时调用
+ * @brief 通知AI对话层后端已经返回完回复音频。
+ *
+ * 该事件只标记后端输出结束，扬声器必须等待Opus、PCM和I2S DMA全部排空后
+ * 才能关闭。
  */
-void ai_dialog_on_reply_end(void);
+esp_err_t ai_dialog_on_audio_end(unsigned turn, unsigned last_sequence);
 
 #ifdef __cplusplus
 }

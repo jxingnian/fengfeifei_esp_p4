@@ -8,7 +8,6 @@ idf_component_register(
         svc_audio
         svc_coze
         app_wake_detection
-        cjson
         freertos
         esp_timer
         esp_audio_codec

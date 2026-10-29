@@ -72,6 +72,9 @@ static void app_on_coze_event(const coze_app_event_t *event, void *context)
 
     case COZE_APP_EVENT_AUDIO_START:
         ESP_LOGI(TAG, "AI开始回复");
+        if (ai_dialog_on_audio_start(event->turn) != ESP_OK) {
+            ESP_LOGE(TAG, "AI回复开始事件转发失败");
+        }
         device_state_send_event(EVENT_AI_REPLY_START);
         break;
 
@@ -82,6 +85,9 @@ static void app_on_coze_event(const coze_app_event_t *event, void *context)
 
     case COZE_APP_EVENT_AUDIO_END:
         ESP_LOGI(TAG, "AI回复结束");
+        if (ai_dialog_on_audio_end(event->turn, event->sequence) != ESP_OK) {
+            ESP_LOGE(TAG, "AI回复结束事件转发失败");
+        }
         device_state_send_event(EVENT_AI_REPLY_END);
         break;
 
@@ -382,10 +388,6 @@ static void on_ai_processing(void)
 static void on_ai_playing(void)
 {
     ESP_LOGI(TAG, "[状态机] AI播放回复");
-
-    // 主动通知AI对话层进入播放状态
-    // 这会驱动 ai_dialog_logic 状态切换，确保解码任务可以处理音频数据
-    ai_dialog_on_reply_start();
 }
 
 static void on_conversation_end(void)
