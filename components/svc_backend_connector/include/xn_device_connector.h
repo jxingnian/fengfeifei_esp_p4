@@ -69,7 +69,7 @@ typedef struct {
     char server_url[256];               // 服务器URL（ws://或wss://）
     uint16_t reconnect_interval_ms;     // 重连间隔（毫秒）
     uint16_t heartbeat_interval_ms;     // 心跳间隔（毫秒）
-    uint16_t pairing_timeout_ms;        // 配对超时（毫秒）
+    uint32_t pairing_timeout_ms;        // 配对超时（毫秒）
     bool auto_reconnect;                // 是否自动重连
     uint8_t voice_protocol;             // 语音协议版本（1或2）
 } xn_connector_config_t;

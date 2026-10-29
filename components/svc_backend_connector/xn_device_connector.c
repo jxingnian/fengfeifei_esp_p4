@@ -2,6 +2,7 @@
 #include "xn_connector_internal.h"
 #include "esp_log.h"
 #include <string.h>
+#include "nvs.h"
 
 static const char *TAG = "xn_connector";
 
@@ -46,6 +47,13 @@ esp_err_t xn_connector_init(const xn_connector_config_t *config)
         ESP_LOGE(TAG, "Failed to init auth module: %s", esp_err_to_name(ret));
         vSemaphoreDelete(g_connector_ctx.state_mutex);
         vEventGroupDelete(g_connector_ctx.event_group);
+        return ret;
+    }
+
+    /* 先迁移旧版数据，再读取正式认证信息，保证已有设备无需重新配对。 */
+    ret = xn_auth_migrate_legacy();
+    if (ret != ESP_OK && ret != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "旧版配对数据迁移失败: %s", esp_err_to_name(ret));
         return ret;
     }
 

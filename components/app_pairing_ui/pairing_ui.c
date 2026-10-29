@@ -27,6 +27,7 @@ static ui_state_t s_state = UI_STATE_IDLE;
 static char s_error_message[256] = {0};
 static bool s_registered = false;
 static bool s_pairing_mode = false;  // 是否处于配对模式
+static pairing_ui_restart_callback_t s_restart_callback = NULL;
 
 // 前向声明
 static esp_err_t pairing_page_handler(httpd_req_t *req);
@@ -93,6 +94,12 @@ void pairing_ui_set_mode(bool is_pairing_mode)
 {
     s_pairing_mode = is_pairing_mode;
     ESP_LOGI(TAG, "配对模式: %s", is_pairing_mode ? "开启" : "关闭");
+}
+
+void pairing_ui_set_restart_callback(pairing_ui_restart_callback_t callback)
+{
+    /* 页面只保存应用层回调，避免反向依赖后台服务组件。 */
+    s_restart_callback = callback;
 }
 
 esp_err_t pairing_ui_update_code(const char *code, int expires_in)
@@ -287,15 +294,13 @@ static esp_err_t app_mode_handler(httpd_req_t *req)
 
 static esp_err_t pairing_restart_handler(httpd_req_t *req)
 {
-    // 需要包含backend_pairing头文件才能调用restart函数
-    extern esp_err_t backend_pairing_restart(void);
-
     char response[128];
 
     ESP_LOGI(TAG, "收到网页重连请求");
 
-    // 调用后台配对重启函数
-    esp_err_t err = backend_pairing_restart();
+    esp_err_t err = s_restart_callback != NULL
+        ? s_restart_callback()
+        : ESP_ERR_INVALID_STATE;
 
     if (err == ESP_OK) {
         snprintf(response, sizeof(response),

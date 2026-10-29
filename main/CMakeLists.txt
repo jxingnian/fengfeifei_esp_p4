@@ -16,6 +16,6 @@ idf_component_register(
         svc_coze
         app_voice_call
         app_video_call
-        svc_backend_pairing
+        svc_backend_connector
         app_pairing_ui
 )

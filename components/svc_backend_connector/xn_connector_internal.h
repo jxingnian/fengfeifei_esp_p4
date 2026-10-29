@@ -17,6 +17,10 @@ extern "C" {
 #define XN_NVS_KEY_AUTH_CODE "auth_code"
 #define XN_NVS_KEY_TENANT_ID "tenant_id"
 
+/* 旧版配对组件使用的 NVS 命名空间，仅用于一次性迁移现有设备数据。 */
+#define XN_LEGACY_NVS_NAMESPACE "pairing"
+#define XN_NVS_KEY_PAIRED "paired"
+
 #define XN_MAX_DEVICE_ID_LEN 64
 #define XN_MAX_AUTH_CODE_LEN 64
 #define XN_MAX_TENANT_ID_LEN 64
@@ -56,6 +60,8 @@ xn_connector_ctx_t *xn_connector_get_context(void);
 esp_err_t xn_auth_init(void);
 esp_err_t xn_auth_save(const xn_auth_info_t *auth_info);
 esp_err_t xn_auth_load(xn_auth_info_t *auth_info);
+/* 将旧版 pairing 命名空间中的认证信息迁移到正式 xn_device 命名空间。 */
+esp_err_t xn_auth_migrate_legacy(void);
 esp_err_t xn_auth_clear(void);
 esp_err_t xn_auth_generate_token(const char *device_id, const char *auth_code, char *token, size_t token_len);
 

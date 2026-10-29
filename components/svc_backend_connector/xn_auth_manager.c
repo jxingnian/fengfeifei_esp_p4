@@ -8,6 +8,9 @@
 
 static const char *TAG = "xn_auth";
 
+/* 迁移函数在认证保存函数之前定义，因此提前声明正式保存接口。 */
+esp_err_t xn_auth_save(const xn_auth_info_t *auth_info);
+
 esp_err_t xn_auth_init(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -27,6 +30,66 @@ esp_err_t xn_auth_init(void)
     }
 
     ESP_LOGI(TAG, "Auth module initialized");
+    return ESP_OK;
+}
+
+esp_err_t xn_auth_migrate_legacy(void)
+{
+    nvs_handle_t legacy_handle;
+    esp_err_t ret = nvs_open(XN_LEGACY_NVS_NAMESPACE, NVS_READONLY, &legacy_handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "打开旧版配对 NVS 失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint8_t paired = 0;
+    ret = nvs_get_u8(legacy_handle, XN_NVS_KEY_PAIRED, &paired);
+    if (ret != ESP_OK || paired == 0) {
+        nvs_close(legacy_handle);
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+
+    xn_auth_info_t legacy_auth = {0};
+    size_t length = sizeof(legacy_auth.device_id);
+    ret = nvs_get_str(legacy_handle, XN_NVS_KEY_DEVICE_ID, legacy_auth.device_id, &length);
+    if (ret == ESP_OK) {
+        length = sizeof(legacy_auth.auth_code);
+        ret = nvs_get_str(legacy_handle, XN_NVS_KEY_AUTH_CODE, legacy_auth.auth_code, &length);
+    }
+    if (ret == ESP_OK) {
+        length = sizeof(legacy_auth.tenant_id);
+        ret = nvs_get_str(legacy_handle, XN_NVS_KEY_TENANT_ID, legacy_auth.tenant_id, &length);
+    }
+    nvs_close(legacy_handle);
+
+    if (ret != ESP_OK || legacy_auth.device_id[0] == '\0' ||
+        legacy_auth.auth_code[0] == '\0' || legacy_auth.tenant_id[0] == '\0') {
+        ESP_LOGE(TAG, "旧版配对数据不完整，拒绝迁移");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    legacy_auth.is_valid = true;
+    ret = xn_auth_save(&legacy_auth);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "迁移旧版配对数据失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = nvs_open(XN_LEGACY_NVS_NAMESPACE, NVS_READWRITE, &legacy_handle);
+    if (ret == ESP_OK) {
+        nvs_erase_all(legacy_handle);
+        ret = nvs_commit(legacy_handle);
+        nvs_close(legacy_handle);
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "清理旧版配对数据失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "旧版配对数据已迁移到 xn_device，并已清理旧存储");
     return ESP_OK;
 }
 

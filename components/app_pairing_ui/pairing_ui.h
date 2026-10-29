@@ -14,6 +14,8 @@
 #include "esp_err.h"
 #include <stdbool.h>
 
+typedef esp_err_t (*pairing_ui_restart_callback_t)(void);
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,6 +33,9 @@ esp_err_t pairing_ui_start(void);
  * @param is_pairing_mode true为配对模式，false为正常模式
  */
 void pairing_ui_set_mode(bool is_pairing_mode);
+
+/** 注册配对重启回调，页面层不直接依赖后台实现。 */
+void pairing_ui_set_restart_callback(pairing_ui_restart_callback_t callback);
 
 /**
  * @brief 更新配对码显示

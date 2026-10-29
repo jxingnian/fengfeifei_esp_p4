@@ -1,0 +1,10 @@
+menu "星念后台连接器配置"
+
+config BACKEND_PAIRING_URL
+    string "后台配对 WebSocket 地址"
+    default "wss://iot.xingnian.vip/ws/device/pair"
+    help
+        配对流程使用的后台 WebSocket 地址。正式连接器会从该地址提取服务器根地址，
+        并使用同一个根地址建立正式设备连接。
+
+endmenu
