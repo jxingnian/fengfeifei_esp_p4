@@ -5,7 +5,7 @@
  * 本版本采用分层架构设计：
  * - 设备状态机：统一调度、资源仲裁、状态转换
  * - 应用层：AI对话、语音通话、视频通话业务
- * - 服务层：音频服务、Coze服务、后台连接服务
+ * - 服务层：音频服务、Coze服务
  * - 驱动层：音频驱动、网络驱动、视频驱动
  */
 
@@ -20,7 +20,6 @@
 // 驱动和服务层
 #include "p4_c5_wifi.h"
 #include "audio_service.h"
-#include "xn_device_connector.h"
 
 // 业务组件
 #include "wake_word.h"
@@ -28,7 +27,6 @@
 #include "coze_app.h"
 #include "voice_call.h"
 #include "video_call.h"
-#include "pairing_ui.h"
 
 // 设备状态机
 #include "device_state_machine.h"
@@ -37,15 +35,7 @@ static const char *TAG = "app_main";
 
 // ========== 全局变量 ==========
 static bool s_coze_connected = false;
-static bool s_backend_connected = false;
 static unsigned s_ai_turn = 0;
-static bool s_pairing_mode = false;  // 配对模式标志
-static bool s_backend_initialized = false;
-static xn_connector_callbacks_t s_backend_callbacks;
-static xn_device_info_t s_pairing_device_info;
-static const char *s_pairing_capabilities[] = {
-    "microphone", "speaker", "camera", "webrtc"
-};
 
 // ========== NVS初始化 ==========
 
@@ -113,92 +103,6 @@ static void app_on_coze_event(const coze_app_event_t *event, void *context)
     case COZE_APP_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Coze连接断开");
         s_coze_connected = false;
-        device_state_send_event(EVENT_BACKEND_DISCONNECTED);
-        break;
-
-    default:
-        break;
-    }
-}
-
-// ========== 后台连接事件处理 ==========
-
-static void app_on_backend_pairing_callback(xn_pairing_event_t event, const char *pairing_id, void *user_data)
-{
-    (void)pairing_id;
-    (void)user_data;
-
-    switch (event) {
-    case XN_PAIRING_EVENT_PENDING:
-        /* 正式连接器返回配对标识后，由本地页面统一显示给用户。 */
-        ESP_LOGI(TAG, "后台配对等待用户确认");
-        pairing_ui_update_code(pairing_id, 300);
-        break;
-    case XN_PAIRING_EVENT_SUCCESS:
-        ESP_LOGI(TAG, "后台配对成功");
-        pairing_ui_show_success();
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        esp_restart();
-        break;
-    case XN_PAIRING_EVENT_FAILED:
-        ESP_LOGE(TAG, "后台配对失败");
-        pairing_ui_show_error("后台返回配对失败");
-        break;
-    case XN_PAIRING_EVENT_TIMEOUT:
-        ESP_LOGE(TAG, "后台配对超时");
-        pairing_ui_show_error("配对已超时，请重新尝试");
-        break;
-    default:
-        break;
-    }
-}
-
-static void app_on_backend_connection_callback(xn_conn_event_t event, void *user_data)
-{
-    (void)user_data;
-
-    switch (event) {
-    case XN_CONN_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "后台服务器已连接");
-        s_backend_connected = true;
-        break;
-
-    case XN_CONN_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "后台服务器已断开");
-        s_backend_connected = false;
-        break;
-
-    case XN_CONN_EVENT_RECONNECTING:
-        ESP_LOGI(TAG, "后台服务器重连中...");
-        break;
-
-    case XN_CONN_EVENT_ERROR:
-        ESP_LOGE(TAG, "后台连接错误");
-        s_backend_connected = false;
-        break;
-
-    default:
-        break;
-    }
-}
-
-static void app_on_backend_message_callback(xn_msg_type_t msg_type, const uint8_t *data, size_t len, void *user_data)
-{
-    (void)user_data;
-
-    switch (msg_type) {
-    case XN_MSG_TYPE_CONTROL:
-        ESP_LOGI(TAG, "收到后台控制消息：%.*s", (int)len, (const char *)data);
-        // TODO: 处理后台控制指令（如远程重启、配置更新等）
-        break;
-
-    case XN_MSG_TYPE_AUDIO:
-        ESP_LOGD(TAG, "收到后台音频数据：%zu bytes", len);
-        // TODO: 处理后台音频数据（如语音通话）
-        break;
-
-    case XN_MSG_TYPE_ERROR:
-        ESP_LOGE(TAG, "后台消息错误");
         break;
 
     default:
@@ -383,99 +287,11 @@ static void on_network_connecting(void)
     // Wi-Fi已经在启动时初始化
 }
 
-/**
- * @brief 初始化唯一的后台连接器，并读取正式认证状态。
- *
- * 配对模式和正常运行模式都必须使用同一个连接器实例，避免再次出现
- * 配对状态由一个组件判断、正式连接由另一个组件判断的分裂问题。
- */
-static esp_err_t app_backend_initialize(void)
-{
-    char backend_server_url[256] = {0};
-    const char *pairing_url = CONFIG_BACKEND_PAIRING_URL;
-    const char *ws_path = strstr(pairing_url, "/ws/");
-
-    if (ws_path != NULL) {
-        size_t base_len = (size_t)(ws_path - pairing_url);
-        if (base_len >= sizeof(backend_server_url)) {
-            return ESP_ERR_INVALID_SIZE;
-        }
-        memcpy(backend_server_url, pairing_url, base_len);
-        backend_server_url[base_len] = '\0';
-    } else {
-        strncpy(backend_server_url, pairing_url, sizeof(backend_server_url) - 1);
-    }
-
-    xn_connector_config_t backend_config = {
-        .reconnect_interval_ms = 5000,
-        .heartbeat_interval_ms = 30000,
-        .pairing_timeout_ms = 300000,
-        .auto_reconnect = true,
-        .voice_protocol = 2,
-    };
-    strncpy(backend_config.server_url, backend_server_url,
-            sizeof(backend_config.server_url) - 1);
-
-    esp_err_t error = xn_connector_init(&backend_config);
-    if (error == ESP_OK) {
-        s_backend_initialized = true;
-        ESP_LOGI(TAG, "后台连接器初始化成功，服务器: %s", backend_server_url);
-    }
-    return error;
-}
-
-/**
- * @brief 启动正式连接器的配对流程。
- *
- * 设备信息和能力数组使用静态存储，保证异步 WebSocket 配对期间指针持续有效。
- */
-static esp_err_t app_backend_start_pairing(void)
-{
-    uint8_t mac[6] = {0};
-    esp_err_t error = esp_wifi_get_mac(WIFI_IF_STA, mac);
-    if (error != ESP_OK) {
-        return error;
-    }
-
-    memset(&s_pairing_device_info, 0, sizeof(s_pairing_device_info));
-    snprintf(s_pairing_device_info.device_uid, sizeof(s_pairing_device_info.device_uid),
-             "%02X%02X%02X%02X%02X%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    strncpy(s_pairing_device_info.name, "ESP32-P4-AI",
-            sizeof(s_pairing_device_info.name) - 1);
-    strncpy(s_pairing_device_info.firmware_version, "1.0.0",
-            sizeof(s_pairing_device_info.firmware_version) - 1);
-    s_pairing_device_info.capabilities = (char **)s_pairing_capabilities;
-    s_pairing_device_info.capabilities_count =
-        (uint8_t)(sizeof(s_pairing_capabilities) / sizeof(s_pairing_capabilities[0]));
-
-    return xn_connector_start_pairing(&s_pairing_device_info, &s_backend_callbacks);
-}
-
-/** 处理配对页面的重新尝试请求，统一复用正式连接器。 */
-static esp_err_t app_backend_restart_pairing(void)
-{
-    esp_err_t error = xn_connector_stop_pairing();
-    if (error != ESP_OK) {
-        return error;
-    }
-    return app_backend_start_pairing();
-}
-
 static void on_service_starting(void)
 {
-    ESP_LOGI(TAG, "[状态机] 启动后台服务");
+    ESP_LOGI(TAG, "[状态机] 启动服务");
 
-    // 后台连接器已在 app_main 启动阶段初始化，这里只负责启动正式连接。
-    esp_err_t error = ESP_OK;
-    if (s_backend_initialized && xn_connector_is_paired()) {
-        error = xn_connector_connect(&s_backend_callbacks);
-        if (error != ESP_OK) {
-            ESP_LOGE(TAG, "后台服务器连接启动失败：%s", esp_err_to_name(error));
-        }
-    }
-
-    // ========== 2. 初始化Coze AI服务 ==========
+    // ========== 初始化Coze AI服务 ==========
     ESP_LOGI(TAG, "初始化Coze AI服务...");
     coze_app_config_t coze_config = {
         .on_event = app_on_coze_event,
@@ -484,14 +300,14 @@ static void on_service_starting(void)
     ESP_ERROR_CHECK(coze_app_init(&coze_config));
 
     // 连接到Coze服务（AI对话长连接）
-    error = coze_app_connect();
+    esp_err_t error = coze_app_connect();
     if (error != ESP_OK) {
         ESP_LOGE(TAG, "Coze连接失败：%s", esp_err_to_name(error));
         device_state_send_event(EVENT_COZE_ERROR);
         return;
     }
 
-    // ========== 3. 初始化AI对话服务 ==========
+    // ========== 初始化AI对话服务 ==========
     ai_dialog_config_t ai_config = {
         .on_event = app_on_ai_dialog_event,
         .context = NULL,
@@ -720,34 +536,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         ESP_LOGI(TAG, "Wi-Fi已连接");
-
-        // 如果处于配对模式，不发送状态机事件
-        if (!s_pairing_mode) {
-            device_state_send_event(EVENT_WIFI_CONNECTED);
-        }
+        device_state_send_event(EVENT_WIFI_CONNECTED);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "获取IP地址: " IPSTR, IP2STR(&event->ip_info.ip));
-
-        // 如果处于配对模式，启动配对流程
-        if (s_pairing_mode) {
-            ESP_LOGI(TAG, "Wi-Fi连接成功，启动配对流程");
-
-            esp_err_t err = app_backend_start_pairing();
-
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "配对启动失败: %s", esp_err_to_name(err));
-                pairing_ui_show_error("配对服务启动失败");
-            }
-        } else {
-            device_state_send_event(EVENT_NETWORK_READY);
-        }
+        device_state_send_event(EVENT_NETWORK_READY);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "Wi-Fi断开");
-
-        if (!s_pairing_mode) {
-            device_state_send_event(EVENT_NETWORK_LOST);
-        }
+        device_state_send_event(EVENT_NETWORK_LOST);
     }
 }
 
@@ -763,40 +559,11 @@ void app_main(void)
     // 初始化事件循环
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // ========== 正式后台连接器初始化与配对检查 ==========
-    s_backend_callbacks.pairing_cb = app_on_backend_pairing_callback;
-    s_backend_callbacks.conn_cb = app_on_backend_connection_callback;
-    s_backend_callbacks.message_cb = app_on_backend_message_callback;
-    s_backend_callbacks.user_data = NULL;
-
-    esp_err_t backend_error = app_backend_initialize();
-    if (backend_error != ESP_OK) {
-        ESP_LOGE(TAG, "后台连接器初始化失败: %s", esp_err_to_name(backend_error));
-        return;
-    }
-
-    s_pairing_mode = !xn_connector_is_paired();
-    if (s_pairing_mode) {
-        ESP_LOGI(TAG, "========== 设备未配对，进入正式配对流程 ==========");
-    } else {
-        ESP_LOGI(TAG, "========== 设备已配对，进入正式后台连接流程 ==========");
-    }
-
     // 注册Wi-Fi事件处理
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                 &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                 &wifi_event_handler, NULL));
-
-    // 如果处于配对模式，先注册配对页面（必须在WiFi启动之前）
-    if (s_pairing_mode) {
-        ESP_LOGI(TAG, "配对模式：注册配对网页...");
-        pairing_ui_set_restart_callback(app_backend_restart_pairing);
-        esp_err_t err = pairing_ui_start();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "配对网页注册失败: %s", esp_err_to_name(err));
-        }
-    }
 
     // 启动Wi-Fi配网
     esp_err_t error = p4_c5_wifi_start();
@@ -804,16 +571,6 @@ void app_main(void)
         ESP_LOGE(TAG, "Wi-Fi启动失败：%s", esp_err_to_name(error));
         return;
     }
-
-    // 如果处于配对模式，只启动WiFi和配对服务，不初始化其他业务组件
-    if (s_pairing_mode) {
-        ESP_LOGI(TAG, "配对模式：等待WiFi连接...");
-        // WiFi连接后会在wifi_event_handler中启动配对流程
-        // 配对完成后设备会自动重启
-        return;
-    }
-
-    // ========== 已配对设备：继续正常初始化 ==========
 
     // 初始化设备状态机
     device_state_callbacks_t state_callbacks = {

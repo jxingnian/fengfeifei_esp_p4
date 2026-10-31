@@ -1,9 +1,0 @@
-idf_component_register(
-    SRCS
-        "pairing_ui.c"
-    INCLUDE_DIRS
-        "."
-    REQUIRES
-        esp_http_server
-        svc_wifi_provisioning
-)
